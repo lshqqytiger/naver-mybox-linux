@@ -191,6 +191,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fuser",
+ "libc",
  "tracing",
  "tracing-subscriber",
 ]

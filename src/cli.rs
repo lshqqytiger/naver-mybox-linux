@@ -30,7 +30,7 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Commands::HealthCheck => {
-            let api = MyboxApiClient::new();
+            let api = MyboxApiClient::from_environment()?;
             api.health_check()?;
             tracing::info!("API health check succeeded");
             Ok(())
