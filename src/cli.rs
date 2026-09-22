@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -12,8 +14,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    Mount { mountpoint: String },
-    Unmount { mountpoint: String },
+    Mount { mountpoint: PathBuf },
+    Unmount { mountpoint: PathBuf },
     Login,
     HealthCheck,
 }
