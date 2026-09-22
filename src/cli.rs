@@ -23,7 +23,11 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Mount { mountpoint } => crate::fuse::mount(&mountpoint),
+        Commands::Mount { mountpoint } => {
+            let store = TokenStore::new(TokenStore::default_path()?);
+            let token = store.load()?.ok_or("not logged in; run `myboxfs login`")?;
+            crate::fuse::mount(&mountpoint, token)
+        }
         Commands::Unmount { mountpoint } => crate::fuse::unmount(&mountpoint),
         Commands::Login => {
             eprintln!(
