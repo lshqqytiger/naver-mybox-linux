@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::api::MyboxApiClient;
+use crate::{Result, api::MyboxApiClient};
 
 #[derive(Debug, Parser)]
 #[command(name = "myboxfs", about = "NAVER MYBOX adapter for Linux")]

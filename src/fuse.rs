@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::Result;
+use crate::Result;
 
 pub fn mount(mountpoint: &Path) -> Result<()> {
     tracing::info!(mountpoint = %mountpoint.display(), "mount requested");
