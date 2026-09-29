@@ -211,20 +211,16 @@ impl<D: RemoteDrive> MyboxFs<D> {
     }
 
     fn read_file(&self, inode: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
-        let file_id = {
+        let (file_id, file_size) = {
             let nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
             let node = nodes.nodes.get(&inode).ok_or("file inode not found")?;
             if node.entry.is_directory() {
                 return Err("cannot read a directory".into());
             }
-            node.entry.resource_id.clone()
+            (node.entry.resource_id.clone(), node.entry.size)
         };
-        let bytes = self.drive.download_file(&file_id)?;
-        let start = usize::try_from(offset)
-            .unwrap_or(usize::MAX)
-            .min(bytes.len());
-        let end = start.saturating_add(size as usize).min(bytes.len());
-        Ok(bytes[start..end].to_vec())
+        let size = (file_size.saturating_sub(offset)).min(size as u64) as u32;
+        self.drive.download_file(&file_id, offset, size)
     }
 }
 
@@ -357,7 +353,7 @@ mod tests {
         root: Vec<RemoteEntry>,
         children: HashMap<String, Vec<RemoteEntry>>,
         files: HashMap<String, Vec<u8>>,
-        downloads: Mutex<Vec<String>>,
+        downloads: Mutex<Vec<(String, u64, u32)>>,
     }
 
     impl RemoteDrive for FakeDrive {
@@ -367,13 +363,15 @@ mod tests {
         fn list_children(&self, folder_id: &str) -> Result<Vec<RemoteEntry>> {
             Ok(self.children.get(folder_id).cloned().unwrap_or_default())
         }
-        fn download_file(&self, file_id: &str) -> Result<Vec<u8>> {
-            self.downloads.lock().unwrap().push(file_id.to_owned());
-            Ok(self
-                .files
-                .get(file_id)
-                .cloned()
-                .ok_or("missing test file")?)
+        fn download_file(&self, file_id: &str, offset: u64, size: u32) -> Result<Vec<u8>> {
+            self.downloads
+                .lock()
+                .unwrap()
+                .push((file_id.to_owned(), offset, size));
+            let file = self.files.get(file_id).ok_or("missing test file")?;
+            let start = (offset as usize).min(file.len());
+            let end = start.saturating_add(size as usize).min(file.len());
+            Ok(file[start..end].to_vec())
         }
     }
 
@@ -438,5 +436,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(filesystem.read_file(hello.ino.0, 6, 3).unwrap(), b"wor");
+        assert_eq!(filesystem.read_file(hello.ino.0, 10, 8).unwrap(), b"d");
+        assert!(filesystem.read_file(hello.ino.0, 11, 8).unwrap().is_empty());
+        assert_eq!(
+            *filesystem.drive.downloads.lock().unwrap(),
+            vec![
+                ("file-1".into(), 6, 3),
+                ("file-1".into(), 10, 1),
+                ("file-1".into(), 11, 0)
+            ]
+        );
     }
 }

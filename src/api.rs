@@ -1,5 +1,6 @@
 use crate::Result;
 use serde::Deserialize;
+use std::io::Read;
 
 const STORAGE_URL: &str = "https://open-api.mybox.naver.com/v1/drive/storage";
 const DRIVE_URL: &str = "https://open-api.mybox.naver.com/v1/drive";
@@ -23,7 +24,7 @@ impl RemoteEntry {
 pub trait RemoteDrive: Send + Sync + 'static {
     fn list_root(&self) -> Result<Vec<RemoteEntry>>;
     fn list_children(&self, folder_id: &str) -> Result<Vec<RemoteEntry>>;
-    fn download_file(&self, file_id: &str) -> Result<Vec<u8>>;
+    fn download_file(&self, file_id: &str, offset: u64, size: u32) -> Result<Vec<u8>>;
 }
 
 pub struct MyboxApiClient {
@@ -102,14 +103,77 @@ impl RemoteDrive for MyboxApiClient {
         ))?)
     }
 
-    fn download_file(&self, file_id: &str) -> Result<Vec<u8>> {
+    fn download_file(&self, file_id: &str, offset: u64, size: u32) -> Result<Vec<u8>> {
+        if size == 0 {
+            return Ok(Vec::new());
+        }
         let download: DownloadResponse =
             self.get_json(&format!("{DRIVE_URL}/files/{file_id}/download"))?;
-        let response = self.client.get(download.download_url).send()?;
+        let mut response = self
+            .client
+            .get(download.download_url)
+            .header(
+                reqwest::header::RANGE,
+                format!("bytes={offset}-{}", offset + size as u64 - 1),
+            )
+            .send()?;
+        #[cfg(debug_assertions)]
+        tracing::debug!(
+            %file_id,
+            offset,
+            size,
+            status = %response.status(),
+            content_type = ?response.headers().get(reqwest::header::CONTENT_TYPE),
+            content_length = ?response.headers().get(reqwest::header::CONTENT_LENGTH),
+            content_range = ?response.headers().get(reqwest::header::CONTENT_RANGE),
+            content_encoding = ?response.headers().get(reqwest::header::CONTENT_ENCODING),
+            transfer_encoding = ?response.headers().get(reqwest::header::TRANSFER_ENCODING),
+            "MYBOX download response"
+        );
         if !response.status().is_success() {
             return Err(format!("MYBOX file download failed: {}", response.status()).into());
         }
-        Ok(response.bytes()?.to_vec())
+        if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            let content_range = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .ok_or("MYBOX partial download missing Content-Range")?
+                .to_str()?;
+            let start = content_range
+                .strip_prefix("bytes ")
+                .and_then(|range| range.split_once('-'))
+                .and_then(|(start, _)| start.parse::<u64>().ok());
+            if start != Some(offset) {
+                return Err("MYBOX partial download has unexpected start offset".into());
+            }
+        } else if response.status() == reqwest::StatusCode::OK && offset > 0 {
+            let skipped = std::io::copy(&mut response.by_ref().take(offset), &mut std::io::sink())?;
+            if skipped < offset {
+                return Ok(Vec::new());
+            }
+        } else if response.status() != reqwest::StatusCode::OK {
+            return Err(format!(
+                "MYBOX file download returned unexpected status: {}",
+                response.status()
+            )
+            .into());
+        }
+        let mut bytes = Vec::with_capacity(size as usize);
+        response
+            .take(size as u64)
+            .read_to_end(&mut bytes)
+            .inspect_err(|_error| {
+                #[cfg(debug_assertions)]
+                {
+                    let error = _error;
+                    let mut source = std::error::Error::source(error);
+                    while let Some(cause) = source {
+                        tracing::debug!(%file_id, %cause, "MYBOX download body error cause");
+                        source = cause.source();
+                    }
+                }
+            })?;
+        Ok(bytes)
     }
 }
 
