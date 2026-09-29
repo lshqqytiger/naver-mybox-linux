@@ -68,6 +68,7 @@ Verification: repeated reads avoid unnecessary transfers, mutations invalidate s
 
 - [ ] Run unit, mocked API, and FUSE integration tests in CI; document the Linux FUSE prerequisites.
 - [ ] Publish reproducible release builds and distro installation/uninstallation guidance.
+- [ ] Add an `/etc/fstab`-compatible mount helper that handles FUSE options and runs with access to the intended user's token without storing credentials in fstab.
 - [ ] Document supported operations, known limitations, troubleshooting, and a final real-account smoke-test procedure.
 
-Verification: a fresh supported Linux machine can install, authenticate, mount, perform supported operations, and unmount successfully.
+Verification: a fresh supported Linux machine can install, authenticate, mount (including via `/etc/fstab`), perform supported operations, and unmount successfully.
