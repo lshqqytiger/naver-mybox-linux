@@ -20,11 +20,17 @@ Use `myboxfs health-check` to verify the saved token.
 myboxfs mount /path/to/mountpoint
 ```
 
-The mount supports directory browsing, file reads, and creating, modifying, and deleting files.
-Writes are buffered in memory and uploaded on flush or close; deleting a file moves it to
-MYBOX trash. Editing an existing file first downloads its entire contents, so very large
-files may be slow or fail if the download times out. Directory creation and deletion,
-renaming, and moving are not supported yet. Check for upload errors when closing files.
+The mount supports directory browsing, file reads, file creation and modification,
+empty-folder creation and removal, and file/folder renaming and moving. Deletion
+moves items to MYBOX trash. Renaming does not replace an existing destination.
+Writes are buffered in memory and uploaded on flush or close. Editing an existing
+file first downloads its entire contents, so very large files may be slow or fail
+if the download times out. Check for upload errors when closing files.
+
+Moving an item to another folder while changing its name requires two MYBOX
+requests. If the rename fails after the move, the item remains in the destination
+folder under its old name. Moving into root requires a nonempty root listing to
+obtain MYBOX's root folder ID.
 
 ## Debug Logs
 

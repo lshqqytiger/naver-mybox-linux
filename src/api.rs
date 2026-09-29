@@ -24,6 +24,7 @@ impl RemoteEntry {
 pub trait RemoteDrive: Send + Sync + 'static {
     fn list_root(&self) -> Result<Vec<RemoteEntry>>;
     fn list_children(&self, folder_id: &str) -> Result<Vec<RemoteEntry>>;
+    fn create_folder(&self, parent_id: Option<&str>, name: &str) -> Result<RemoteEntry>;
     fn download_file(&self, file_id: &str, offset: u64, size: u32) -> Result<Vec<u8>>;
     fn upload_file(
         &self,
@@ -33,6 +34,8 @@ pub trait RemoteDrive: Send + Sync + 'static {
         overwrite: bool,
     ) -> Result<RemoteEntry>;
     fn delete_file(&self, file_id: &str) -> Result<()>;
+    fn move_resource(&self, resource_id: &str, parent_id: Option<&str>) -> Result<()>;
+    fn rename_resource(&self, resource_id: &str, name: &str) -> Result<()>;
 }
 
 pub struct MyboxApiClient {
@@ -109,6 +112,28 @@ impl RemoteDrive for MyboxApiClient {
         self.list_resources(reqwest::Url::parse(&format!(
             "{DRIVE_URL}/folders/{folder_id}/resources"
         ))?)
+    }
+
+    fn create_folder(&self, parent_id: Option<&str>, name: &str) -> Result<RemoteEntry> {
+        let response = self
+            .client
+            .post(format!("{DRIVE_URL}/folders"))
+            .bearer_auth(&self.access_token)
+            .json(&FolderRequest {
+                folder_name: name,
+                parent_id,
+            })
+            .send()?;
+        if !response.status().is_success() {
+            return Err(format!("MYBOX folder creation failed: {}", response.status()).into());
+        }
+        let folder: CreatedFolder = response.json()?;
+        Ok(RemoteEntry {
+            resource_id: folder.resource_id,
+            name: folder.name,
+            size: 0,
+            kind: "folder".into(),
+        })
     }
 
     fn download_file(&self, file_id: &str, offset: u64, size: u32) -> Result<Vec<u8>> {
@@ -239,6 +264,88 @@ impl RemoteDrive for MyboxApiClient {
         }
         Ok(())
     }
+
+    fn move_resource(&self, resource_id: &str, parent_id: Option<&str>) -> Result<()> {
+        let root_id;
+        let parent_id = match parent_id {
+            Some(parent_id) => parent_id,
+            None => {
+                let roots: RootParents =
+                    self.get_json(&format!("{DRIVE_URL}/resources?count=1"))?;
+                root_id = roots
+                    .resources
+                    .into_iter()
+                    .next()
+                    .ok_or("cannot determine root folder ID from an empty root listing")?
+                    .parent_id;
+                &root_id
+            }
+        };
+        let response = self
+            .client
+            .post(format!("{DRIVE_URL}/resources/{resource_id}/move"))
+            .bearer_auth(&self.access_token)
+            .json(&MoveRequest {
+                parent_id,
+                is_overwrite: false,
+            })
+            .send()?;
+        if !response.status().is_success() {
+            return Err(format!("MYBOX resource move failed: {}", response.status()).into());
+        }
+        Ok(())
+    }
+
+    fn rename_resource(&self, resource_id: &str, name: &str) -> Result<()> {
+        let response = self
+            .client
+            .post(format!("{DRIVE_URL}/resources/{resource_id}/rename"))
+            .bearer_auth(&self.access_token)
+            .json(&RenameRequest { name })
+            .send()?;
+        if !response.status().is_success() {
+            return Err(format!("MYBOX resource rename failed: {}", response.status()).into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct RootParents {
+    resources: Vec<RootParent>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RootParent {
+    parent_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MoveRequest<'a> {
+    parent_id: &'a str,
+    is_overwrite: bool,
+}
+
+#[derive(Serialize)]
+struct RenameRequest<'a> {
+    name: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderRequest<'a> {
+    folder_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_id: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreatedFolder {
+    resource_id: String,
+    name: String,
 }
 
 #[derive(Serialize)]

@@ -372,9 +372,236 @@ impl<D: RemoteDrive> MyboxFs<D> {
         nodes.dirty.remove(&inode);
         Ok(())
     }
+
+    fn mkdir_folder(&self, parent: u64, name: &OsStr) -> std::result::Result<FileAttr, Errno> {
+        let name = valid_name(name)?;
+        self.ensure_directory(parent)?;
+        self.ensure_children(parent).map_err(|error| {
+            tracing::warn!(%error, "MYBOX parent listing failed");
+            Errno::EIO
+        })?;
+        let mut nodes = self.nodes.lock().map_err(|_| Errno::EIO)?;
+        let parent_id = if parent == ROOT_INODE {
+            None
+        } else {
+            let parent_node = nodes.nodes.get(&parent).ok_or(Errno::ENOENT)?;
+            if !parent_node.entry.is_directory() {
+                return Err(Errno::ENOTDIR);
+            }
+            Some(parent_node.entry.resource_id.as_str())
+        };
+        if child_inode(&nodes, parent, name).is_some() {
+            return Err(Errno::EEXIST);
+        }
+        let entry = self.drive.create_folder(parent_id, name).map_err(|error| {
+            tracing::warn!(%error, "MYBOX folder creation failed");
+            Errno::EIO
+        })?;
+        let inode = nodes.next_inode;
+        nodes.next_inode += 1;
+        let node = Node {
+            inode,
+            parent,
+            entry,
+        };
+        let attr = self.entry_attr(&node);
+        nodes.nodes.insert(inode, node);
+        nodes.children.entry(parent).or_default().push(inode);
+        nodes.children.insert(inode, Vec::new());
+        nodes.loaded_directories.insert(inode);
+        Ok(attr)
+    }
+
+    fn rmdir_folder(&self, parent: u64, name: &OsStr) -> std::result::Result<(), Errno> {
+        let name = valid_name(name)?;
+        self.ensure_directory(parent)?;
+        self.ensure_children(parent).map_err(|_| Errno::EIO)?;
+        let inode = {
+            let nodes = self.nodes.lock().map_err(|_| Errno::EIO)?;
+            let inode = child_inode(&nodes, parent, name).ok_or(Errno::ENOENT)?;
+            if !nodes.nodes[&inode].entry.is_directory() {
+                return Err(Errno::ENOTDIR);
+            }
+            inode
+        };
+        self.ensure_children(inode).map_err(|error| {
+            tracing::warn!(%error, "MYBOX folder listing failed");
+            Errno::EIO
+        })?;
+        let mut nodes = self.nodes.lock().map_err(|_| Errno::EIO)?;
+        if !nodes.children.get(&inode).ok_or(Errno::ENOENT)?.is_empty() {
+            return Err(Errno::ENOTEMPTY);
+        }
+        let resource_id = &nodes
+            .nodes
+            .get(&inode)
+            .ok_or(Errno::ENOENT)?
+            .entry
+            .resource_id;
+        let remote_children = self.drive.list_children(resource_id).map_err(|error| {
+            tracing::warn!(%error, "MYBOX folder listing failed before deletion");
+            Errno::EIO
+        })?;
+        if !remote_children.is_empty() {
+            return Err(Errno::ENOTEMPTY);
+        }
+        self.drive.delete_file(resource_id).map_err(|error| {
+            tracing::warn!(%error, "MYBOX folder deletion failed");
+            Errno::EIO
+        })?;
+        nodes
+            .children
+            .get_mut(&parent)
+            .ok_or(Errno::ENOENT)?
+            .retain(|child| *child != inode);
+        nodes.children.remove(&inode);
+        nodes.loaded_directories.remove(&inode);
+        nodes.nodes.remove(&inode);
+        Ok(())
+    }
+
+    fn rename_path(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+    ) -> std::result::Result<(), Errno> {
+        let name = valid_name(name)?;
+        let newname = valid_name(newname)?;
+        self.ensure_directory(parent)?;
+        self.ensure_directory(newparent)?;
+        self.ensure_children(parent).map_err(|_| Errno::EIO)?;
+        self.ensure_children(newparent).map_err(|_| Errno::EIO)?;
+        let mut nodes = self.nodes.lock().map_err(|_| Errno::EIO)?;
+        let inode = child_inode(&nodes, parent, name).ok_or(Errno::ENOENT)?;
+        if parent == newparent && name == newname {
+            return Ok(());
+        }
+        if child_inode(&nodes, newparent, newname).is_some() {
+            return Err(Errno::EEXIST);
+        }
+        if parent != newparent && child_inode(&nodes, newparent, name).is_some() {
+            return Err(Errno::EEXIST);
+        }
+        let mut ancestor = newparent;
+        while ancestor != ROOT_INODE {
+            if ancestor == inode {
+                return Err(Errno::EINVAL);
+            }
+            ancestor = nodes.nodes.get(&ancestor).ok_or(Errno::ENOENT)?.parent;
+        }
+        let resource_id = nodes
+            .nodes
+            .get(&inode)
+            .ok_or(Errno::ENOENT)?
+            .entry
+            .resource_id
+            .clone();
+        if parent != newparent {
+            let parent_id = nodes
+                .nodes
+                .get(&newparent)
+                .map(|node| node.entry.resource_id.as_str());
+            self.drive
+                .move_resource(&resource_id, parent_id)
+                .map_err(|error| {
+                    tracing::warn!(%error, "MYBOX resource move failed");
+                    Errno::EIO
+                })?;
+            nodes
+                .children
+                .get_mut(&parent)
+                .ok_or(Errno::EIO)?
+                .retain(|child| *child != inode);
+            nodes
+                .children
+                .get_mut(&newparent)
+                .ok_or(Errno::EIO)?
+                .push(inode);
+            nodes.nodes.get_mut(&inode).ok_or(Errno::EIO)?.parent = newparent;
+        }
+        if name != newname {
+            self.drive
+                .rename_resource(&resource_id, newname)
+                .map_err(|error| {
+                    tracing::warn!(%error, "MYBOX resource rename failed after move");
+                    Errno::EIO
+                })?;
+            nodes.nodes.get_mut(&inode).ok_or(Errno::EIO)?.entry.name = newname.to_owned();
+        }
+        Ok(())
+    }
+
+    fn ensure_directory(&self, inode: u64) -> std::result::Result<(), Errno> {
+        let attr = self.attr(inode).ok_or(Errno::ENOENT)?;
+        if attr.kind != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        Ok(())
+    }
+}
+
+fn valid_name(name: &OsStr) -> std::result::Result<&str, Errno> {
+    let name = name.to_str().ok_or(Errno::EINVAL)?;
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(Errno::EINVAL);
+    }
+    Ok(name)
+}
+
+fn child_inode(nodes: &NodeTable, parent: u64, name: &str) -> Option<u64> {
+    nodes.children.get(&parent)?.iter().copied().find(|inode| {
+        nodes
+            .nodes
+            .get(inode)
+            .is_some_and(|node| node.entry.name == name)
+    })
 }
 
 impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        match self.mkdir_folder(parent.0, name) {
+            Ok(attr) => reply.entry(&ATTR_TTL, &attr, Generation(0)),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.rmdir_folder(parent.0, name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: fuser::RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        if !flags.is_empty() {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        match self.rename_path(parent.0, name, newparent.0, newname) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
     fn create(
         &self,
         _req: &Request,
@@ -674,6 +901,8 @@ mod tests {
         downloads: Mutex<Vec<(String, u64, u32)>>,
         fail_upload: Mutex<bool>,
         fail_delete: Mutex<bool>,
+        fail_move: Mutex<bool>,
+        fail_rename: Mutex<bool>,
     }
 
     impl RemoteDrive for FakeDrive {
@@ -688,6 +917,20 @@ mod tests {
                 .get(folder_id)
                 .cloned()
                 .unwrap_or_default())
+        }
+        fn create_folder(&self, parent_id: Option<&str>, name: &str) -> Result<RemoteEntry> {
+            let entry = entry(&format!("folder-{name}"), name, 0, "folder");
+            let mut root = self.root.lock().unwrap();
+            let mut children = self.children.lock().unwrap();
+            let siblings = match parent_id {
+                Some(parent_id) => children.entry(parent_id.to_owned()).or_default(),
+                None => &mut root,
+            };
+            if siblings.iter().any(|existing| existing.name == name) {
+                return Err("folder exists".into());
+            }
+            siblings.push(entry.clone());
+            Ok(entry)
         }
         fn download_file(&self, file_id: &str, offset: u64, size: u32) -> Result<Vec<u8>> {
             self.downloads
@@ -743,6 +986,55 @@ mod tests {
             self.files.lock().unwrap().remove(file_id);
             Ok(())
         }
+        fn move_resource(&self, resource_id: &str, parent_id: Option<&str>) -> Result<()> {
+            if *self.fail_move.lock().unwrap() {
+                return Err("move failed".into());
+            }
+            let mut root = self.root.lock().unwrap();
+            let mut children = self.children.lock().unwrap();
+            let entry = if let Some(index) = root
+                .iter()
+                .position(|entry| entry.resource_id == resource_id)
+            {
+                root.remove(index)
+            } else {
+                let siblings = children
+                    .values_mut()
+                    .find(|siblings| {
+                        siblings
+                            .iter()
+                            .any(|entry| entry.resource_id == resource_id)
+                    })
+                    .ok_or("resource not found")?;
+                let index = siblings
+                    .iter()
+                    .position(|entry| entry.resource_id == resource_id)
+                    .unwrap();
+                siblings.remove(index)
+            };
+            match parent_id {
+                Some(parent_id) => children
+                    .entry(parent_id.to_owned())
+                    .or_default()
+                    .push(entry),
+                None => root.push(entry),
+            }
+            Ok(())
+        }
+        fn rename_resource(&self, resource_id: &str, name: &str) -> Result<()> {
+            if *self.fail_rename.lock().unwrap() {
+                return Err("rename failed".into());
+            }
+            let mut root = self.root.lock().unwrap();
+            let mut children = self.children.lock().unwrap();
+            let entry = root
+                .iter_mut()
+                .chain(children.values_mut().flatten())
+                .find(|entry| entry.resource_id == resource_id)
+                .ok_or("resource not found")?;
+            entry.name = name.to_owned();
+            Ok(())
+        }
     }
 
     fn entry(id: &str, name: &str, size: u64, kind: &str) -> RemoteEntry {
@@ -771,6 +1063,8 @@ mod tests {
             downloads: Mutex::new(Vec::new()),
             fail_upload: Mutex::new(false),
             fail_delete: Mutex::new(false),
+            fail_move: Mutex::new(false),
+            fail_rename: Mutex::new(false),
         })
     }
 
@@ -972,5 +1266,301 @@ mod tests {
             filesystem.read_file(file.ino.0, 0, 20).unwrap(),
             b"replacement"
         );
+    }
+
+    #[test]
+    fn creates_and_removes_only_empty_folders() {
+        let filesystem = filesystem();
+        let folder = filesystem
+            .mkdir_folder(ROOT_INODE, OsStr::new("New"))
+            .unwrap();
+        assert_eq!(folder.kind, FileType::Directory);
+        assert!(
+            filesystem
+                .directory_entries(folder.ino.0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            filesystem
+                .mkdir_folder(ROOT_INODE, OsStr::new("New"))
+                .unwrap_err(),
+            Errno::EEXIST
+        );
+        assert_eq!(
+            filesystem.rmdir_folder(ROOT_INODE, OsStr::new("Documents")),
+            Err(Errno::ENOTEMPTY)
+        );
+        filesystem
+            .rmdir_folder(ROOT_INODE, OsStr::new("New"))
+            .unwrap();
+        assert!(
+            filesystem
+                .lookup_entry(ROOT_INODE, OsStr::new("New"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            filesystem.rmdir_folder(ROOT_INODE, OsStr::new("hello.txt")),
+            Err(Errno::ENOTDIR)
+        );
+    }
+
+    #[test]
+    fn moves_and_renames_files_and_folders_without_changing_inodes() {
+        let filesystem = filesystem();
+        let documents = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("Documents"))
+            .unwrap()
+            .unwrap();
+        let notes = filesystem
+            .lookup_entry(documents.ino.0, OsStr::new("notes.txt"))
+            .unwrap()
+            .unwrap();
+        filesystem
+            .rename_path(
+                documents.ino.0,
+                OsStr::new("notes.txt"),
+                documents.ino.0,
+                OsStr::new("renamed.txt"),
+            )
+            .unwrap();
+        filesystem
+            .rename_path(
+                documents.ino.0,
+                OsStr::new("renamed.txt"),
+                ROOT_INODE,
+                OsStr::new("moved.txt"),
+            )
+            .unwrap();
+        assert_eq!(
+            filesystem
+                .lookup_entry(ROOT_INODE, OsStr::new("moved.txt"))
+                .unwrap()
+                .unwrap()
+                .ino,
+            notes.ino
+        );
+        assert!(
+            filesystem
+                .lookup_entry(documents.ino.0, OsStr::new("renamed.txt"))
+                .unwrap()
+                .is_none()
+        );
+        filesystem
+            .rename_path(
+                ROOT_INODE,
+                OsStr::new("Documents"),
+                ROOT_INODE,
+                OsStr::new("Archive"),
+            )
+            .unwrap();
+        assert_eq!(
+            filesystem
+                .lookup_entry(ROOT_INODE, OsStr::new("Archive"))
+                .unwrap()
+                .unwrap()
+                .ino,
+            documents.ino
+        );
+    }
+
+    #[test]
+    fn rejects_rename_collisions_and_cycles() {
+        let filesystem = filesystem();
+        let documents = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("Documents"))
+            .unwrap()
+            .unwrap();
+        let nested = filesystem
+            .mkdir_folder(documents.ino.0, OsStr::new("Nested"))
+            .unwrap();
+        assert_eq!(
+            filesystem.rename_path(
+                ROOT_INODE,
+                OsStr::new("Documents"),
+                nested.ino.0,
+                OsStr::new("Cycle")
+            ),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            filesystem.rename_path(
+                ROOT_INODE,
+                OsStr::new("hello.txt"),
+                documents.ino.0,
+                OsStr::new("notes.txt")
+            ),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(
+            filesystem.rename_path(
+                ROOT_INODE,
+                OsStr::new("hello.txt"),
+                ROOT_INODE,
+                OsStr::new("Documents")
+            ),
+            Err(Errno::EEXIST)
+        );
+        assert!(
+            filesystem
+                .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn keeps_local_links_in_sync_with_partial_remote_failures() {
+        let filesystem = filesystem();
+        let documents = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("Documents"))
+            .unwrap()
+            .unwrap();
+        *filesystem.drive.fail_move.lock().unwrap() = true;
+        assert_eq!(
+            filesystem.rename_path(
+                ROOT_INODE,
+                OsStr::new("hello.txt"),
+                documents.ino.0,
+                OsStr::new("new.txt")
+            ),
+            Err(Errno::EIO)
+        );
+        assert!(
+            filesystem
+                .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+                .unwrap()
+                .is_some()
+        );
+        *filesystem.drive.fail_move.lock().unwrap() = false;
+        *filesystem.drive.fail_rename.lock().unwrap() = true;
+        assert_eq!(
+            filesystem.rename_path(
+                ROOT_INODE,
+                OsStr::new("hello.txt"),
+                documents.ino.0,
+                OsStr::new("new.txt")
+            ),
+            Err(Errno::EIO)
+        );
+        assert!(
+            filesystem
+                .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            filesystem
+                .lookup_entry(documents.ino.0, OsStr::new("hello.txt"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            filesystem
+                .lookup_entry(documents.ino.0, OsStr::new("new.txt"))
+                .unwrap()
+                .is_none()
+        );
+        *filesystem.drive.fail_delete.lock().unwrap() = true;
+        let empty = filesystem
+            .mkdir_folder(ROOT_INODE, OsStr::new("Empty"))
+            .unwrap();
+        assert_eq!(
+            filesystem.rmdir_folder(ROOT_INODE, OsStr::new("Empty")),
+            Err(Errno::EIO)
+        );
+        assert!(filesystem.attr(empty.ino.0).is_some());
+    }
+
+    #[test]
+    fn moving_a_loaded_folder_preserves_its_descendants() {
+        let filesystem = filesystem();
+        let documents = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("Documents"))
+            .unwrap()
+            .unwrap();
+        let notes = filesystem
+            .lookup_entry(documents.ino.0, OsStr::new("notes.txt"))
+            .unwrap()
+            .unwrap();
+        let destination = filesystem
+            .mkdir_folder(ROOT_INODE, OsStr::new("Destination"))
+            .unwrap();
+        filesystem
+            .rename_path(
+                ROOT_INODE,
+                OsStr::new("Documents"),
+                destination.ino.0,
+                OsStr::new("Documents"),
+            )
+            .unwrap();
+        assert!(
+            filesystem
+                .lookup_entry(ROOT_INODE, OsStr::new("Documents"))
+                .unwrap()
+                .is_none()
+        );
+        let moved = filesystem
+            .lookup_entry(destination.ino.0, OsStr::new("Documents"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(moved.ino, documents.ino);
+        assert_eq!(
+            filesystem
+                .lookup_entry(moved.ino.0, OsStr::new("notes.txt"))
+                .unwrap()
+                .unwrap()
+                .ino,
+            notes.ino
+        );
+        assert_eq!(
+            filesystem.nodes.lock().unwrap().nodes[&documents.ino.0].parent,
+            destination.ino.0
+        );
+        assert_eq!(
+            filesystem.rmdir_folder(destination.ino.0, OsStr::new("Documents")),
+            Err(Errno::ENOTEMPTY)
+        );
+    }
+
+    #[test]
+    fn checks_remote_emptiness_and_parent_types_before_mutating() {
+        let filesystem = filesystem();
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            filesystem
+                .mkdir_folder(file.ino.0, OsStr::new("Invalid"))
+                .unwrap_err(),
+            Errno::ENOTDIR
+        );
+        assert_eq!(
+            filesystem.rmdir_folder(file.ino.0, OsStr::new("Invalid")),
+            Err(Errno::ENOTDIR)
+        );
+        assert_eq!(
+            filesystem.rename_path(
+                ROOT_INODE,
+                OsStr::new("Documents"),
+                file.ino.0,
+                OsStr::new("Invalid")
+            ),
+            Err(Errno::ENOTDIR)
+        );
+        let folder = filesystem
+            .mkdir_folder(ROOT_INODE, OsStr::new("New"))
+            .unwrap();
+        filesystem.drive.children.lock().unwrap().insert(
+            "folder-New".into(),
+            vec![entry("outside", "outside.txt", 1, "file")],
+        );
+        assert_eq!(
+            filesystem.rmdir_folder(ROOT_INODE, OsStr::new("New")),
+            Err(Errno::ENOTEMPTY)
+        );
+        assert!(filesystem.attr(folder.ino.0).is_some());
     }
 }

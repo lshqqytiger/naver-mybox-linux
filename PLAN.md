@@ -38,10 +38,11 @@ Verification: tests run without MYBOX credentials and catch remote API contract 
 
 ## 4. Finish Filesystem Operations
 
-- [ ] Implement folder creation and removal (`mkdir`, `rmdir`) with correct empty-folder and error behavior.
-- [ ] Implement rename and move for files and folders, including cross-directory moves and collision rules.
-- [ ] Update in-memory parent/child mappings after each successful remote mutation; preserve local state on failure.
-- [ ] Return appropriate Linux errors for unsupported operations, missing entries, conflicts, and permission failures.
+- [x] Implement folder creation and removal (`mkdir`, `rmdir`) with empty-folder checks.
+- [x] Implement file/folder rename and cross-directory move without replacing existing destinations.
+- [x] Update in-memory parent/child mappings after successful remote steps and keep them consistent on failure.
+- [ ] Verify folder and rename operations against a live MYBOX account, including moves into root and two-step partial failures.
+- [ ] Finish Linux error mapping for all operations and decide whether safe destination replacement is supported.
 
 Verification: `mkdir`, `rmdir`, `mv`, `rm`, `cp`, `cat`, and `ls` work in the mocked mount and a real-account smoke run.
 
