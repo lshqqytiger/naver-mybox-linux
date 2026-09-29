@@ -49,7 +49,7 @@ Verification: `mkdir`, `rmdir`, `mv`, `rm`, `cp`, `cat`, and `ls` work in the mo
 ## 5. Harden Writes and Network Failures
 
 - [ ] Replace whole-file in-memory edit buffers with bounded temporary storage or chunked uploads where the API supports them.
-- [ ] Define persistence semantics for concurrent open handles, `fsync`, `flush`, and failed close; prevent a failed upload from silently losing edits.
+- [ ] Finish persistence semantics for concurrent open handles, `fsync`, `flush`, and failed close; handle remote edit conflicts atomically if the API permits it (pre-upload size/time checks are best-effort).
 - [ ] Map API/network failures to errno consistently and retry only safe transient requests (429, 5xx, timeouts) with bounded backoff.
 - [ ] Track file size and modification time from remote metadata; invalidate directory and attribute caches after mutations.
 

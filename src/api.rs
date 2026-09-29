@@ -13,6 +13,8 @@ pub struct RemoteEntry {
     pub size: u64,
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(rename = "modifiedAt", default)]
+    pub modified_at: Option<String>,
 }
 
 impl RemoteEntry {
@@ -24,6 +26,7 @@ impl RemoteEntry {
 pub trait RemoteDrive: Send + Sync + 'static {
     fn list_root(&self) -> Result<Vec<RemoteEntry>>;
     fn list_children(&self, folder_id: &str) -> Result<Vec<RemoteEntry>>;
+    fn file_metadata(&self, file_id: &str) -> Result<RemoteEntry>;
     fn create_folder(&self, parent_id: Option<&str>, name: &str) -> Result<RemoteEntry>;
     fn download_file(&self, file_id: &str, offset: u64, size: u32) -> Result<Vec<u8>>;
     fn upload_file(
@@ -101,6 +104,23 @@ impl MyboxApiClient {
 
         Ok(resources)
     }
+
+    fn download_range(
+        &self,
+        url: &str,
+        offset: u64,
+        size: u32,
+    ) -> Result<reqwest::blocking::Response> {
+        Ok(self
+            .client
+            .get(url)
+            .header(
+                reqwest::header::RANGE,
+                format!("bytes={offset}-{}", offset + size as u64 - 1),
+            )
+            .send()
+            .map_err(reqwest::Error::without_url)?)
+    }
 }
 
 impl RemoteDrive for MyboxApiClient {
@@ -112,6 +132,10 @@ impl RemoteDrive for MyboxApiClient {
         self.list_resources(reqwest::Url::parse(&format!(
             "{DRIVE_URL}/folders/{folder_id}/resources"
         ))?)
+    }
+
+    fn file_metadata(&self, file_id: &str) -> Result<RemoteEntry> {
+        self.get_json(&format!("{DRIVE_URL}/resources/{file_id}"))
     }
 
     fn create_folder(&self, parent_id: Option<&str>, name: &str) -> Result<RemoteEntry> {
@@ -133,6 +157,7 @@ impl RemoteDrive for MyboxApiClient {
             name: folder.name,
             size: 0,
             kind: "folder".into(),
+            modified_at: None,
         })
     }
 
@@ -142,14 +167,7 @@ impl RemoteDrive for MyboxApiClient {
         }
         let download: DownloadResponse =
             self.get_json(&format!("{DRIVE_URL}/files/{file_id}/download"))?;
-        let mut response = self
-            .client
-            .get(download.download_url)
-            .header(
-                reqwest::header::RANGE,
-                format!("bytes={offset}-{}", offset + size as u64 - 1),
-            )
-            .send()?;
+        let mut response = self.download_range(&download.download_url, offset, size)?;
         #[cfg(debug_assertions)]
         tracing::debug!(
             %file_id,
@@ -180,7 +198,8 @@ impl RemoteDrive for MyboxApiClient {
                 return Err("MYBOX partial download has unexpected start offset".into());
             }
         } else if response.status() == reqwest::StatusCode::OK && offset > 0 {
-            let skipped = std::io::copy(&mut response.by_ref().take(offset), &mut std::io::sink())?;
+            let skipped = std::io::copy(&mut response.by_ref().take(offset), &mut std::io::sink())
+                .map_err(|error| format!("MYBOX download seek failed ({:?})", error.kind()))?;
             if skipped < offset {
                 return Ok(Vec::new());
             }
@@ -195,17 +214,7 @@ impl RemoteDrive for MyboxApiClient {
         response
             .take(size as u64)
             .read_to_end(&mut bytes)
-            .inspect_err(|_error| {
-                #[cfg(debug_assertions)]
-                {
-                    let error = _error;
-                    let mut source = std::error::Error::source(error);
-                    while let Some(cause) = source {
-                        tracing::debug!(%file_id, %cause, "MYBOX download body error cause");
-                        source = cause.source();
-                    }
-                }
-            })?;
+            .map_err(|error| format!("MYBOX download body read failed ({:?})", error.kind()))?;
         Ok(bytes)
     }
 
@@ -381,4 +390,19 @@ struct ResponseMetadata {
 struct DownloadResponse {
     #[serde(rename = "downloadUrl")]
     download_url: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_signed_download_does_not_expose_its_query() {
+        let client = MyboxApiClient::new("unused");
+        let error = client
+            .download_range("http://127.0.0.1:0/download?stoken=private-marker", 0, 10)
+            .err()
+            .expect("unused local port should fail");
+        assert!(!error.to_string().contains("private-marker"));
+    }
 }
