@@ -40,4 +40,6 @@ body-read errors. File reads request only the bytes needed by FUSE.
 Debug logs are enabled by default in debug builds and are unavailable in release builds.
 Set `RUST_LOG=info` to reduce logging in a debug build.
 
-Implementation plans are maintained in [`PLAN.md`](./PLAN.md).
+Implementation plans are maintained in [`PLAN.md`](./PLAN.md). See the
+[`docs/`](./docs/) directory for the [architecture](./docs/architecture.md)
+and [workflow notes](./docs/workflows.md).
