@@ -15,7 +15,9 @@ flowchart TD
     Fuse --> Drive[RemoteDrive trait]
     API --> Drive
     Fake[FakeDrive in FUSE tests] --> Drive
-    Fuse --> Table[NodeTable: inodes and staged data]
+      Fuse --> Table[NodeTable: inodes and directory metadata]
+      Fuse --> Cache[ReadCache: bounded clean ranges]
+      Fuse --> Staging[Temporary files: pending edits]
     API --> Remote[MYBOX Drive API]
 ```
 
@@ -28,7 +30,7 @@ flowchart TD
 | `src/auth.rs`  | Reads and writes the personal access token under the XDG config directory (or `~/.config`); on Unix, saved token files are mode `0600`. |
 | `src/api.rs`   | Defines `RemoteEntry` and the `RemoteDrive` interface, and implements MYBOX HTTP requests using a blocking `reqwest` client.            |
 | `src/fuse.rs`  | Implements FUSE callbacks, maps remote items to in-memory inodes, stages file edits, and starts or stops the mount.                     |
-| `src/cache.rs` | Contains an empty `MetadataCache` placeholder; it is not currently used by the filesystem.                                              |
+| `src/cache.rs` | Implements a 4 MiB, two-second cache for clean file read ranges.                                                                        |
 | `src/lib.rs`   | Exposes the modules and the shared boxed-error `Result` type.                                                                           |
 
 ## Filesystem State
@@ -36,15 +38,18 @@ flowchart TD
 `MyboxFs<D>` depends on `RemoteDrive`, so the same filesystem logic can use
 the production `MyboxApiClient` or a fake drive in tests. A mutex-protected
 `NodeTable` holds the synthetic inode-to-entry mapping, parent/child inode
-lists, directories loaded during this mount, and dirty file contents. Inode
-1 represents the root; other inodes are assigned as directories are loaded
-or items are created.
+lists, directory listing expiration times, open/lookup references, and temporary
+file handles for dirty data. Inode 1 represents the root; other inodes are
+assigned as directories are loaded or items are created.
 
-Directory contents are fetched on first access and then served from the
-in-memory table for the rest of the mount. Successful local mutations update
-that table. There is no active metadata cache, TTL-based refresh, or
-cross-process change detection. FUSE attributes use a one-second kernel
-attribute TTL; timestamps are currently reported as the Unix epoch.
+Directory contents are refreshed after five seconds, preserving existing
+inodes by resource ID. Successful local mutations update the table immediately.
+Clean read ranges are cached for two seconds (4 MiB maximum) and invalidated
+on local edits and detected remote metadata changes. FUSE attributes have a
+one-second kernel TTL and use remote RFC3339 modification times when present;
+the Unix epoch is used when they are unavailable. External edits can remain
+stale until the listing refreshes, and retained directory metadata is not yet
+bounded in memory.
 
 ## Request Flow
 
@@ -57,10 +62,11 @@ attribute TTL; timestamps are currently reported as the Unix epoch.
 4. FUSE callbacks consult or update `NodeTable`, then call `RemoteDrive` for
    remote reads and mutations.
 5. `MyboxApiClient` sends authenticated API requests. File uploads use a
-   separate upload URL returned by MYBOX; file downloads use a separate
-   download URL.
+   separate HTTPS upload URL returned by MYBOX; file downloads use a separate
+   HTTPS download URL. The HTTP client verifies certificates, bounds request
+   times, and retries only safe read requests on transient failures.
 
 `MyboxApiClient::list_resources` follows API cursors to collect all pages.
-Tests can implement `RemoteDrive` without MYBOX credentials. The current
-tests focus on filesystem behavior; the production HTTP client is not
-replaced by a mock HTTP server in this codebase.
+Tests can implement `RemoteDrive` without MYBOX credentials. Filesystem tests
+use a fake drive; a local HTTP test covers a transient read retry, but the
+full MYBOX API contract has not been exercised against a mock HTTP server.

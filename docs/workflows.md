@@ -16,29 +16,36 @@
 
 The root directory is represented by a synthetic inode. Its first listing
 calls the root resources endpoint; a nested directory is listed on first
-access through its resource ID. The resulting entries are retained in the
-in-memory inode table for the lifetime of the mount.
+access through its resource ID. Listings refresh after five seconds,
+preserving inodes for unchanged resource IDs. Remote changes can remain
+invisible until the next refresh.
 
 File reads request the requested byte range through MYBOX's download URL.
 If the server returns a full `200 OK` response instead of partial content,
 the client skips to the requested offset before reading the requested number
-of bytes. Debug builds log download response headers and body-read error
-causes; release builds omit those debug diagnostics.
+of bytes. Clean ranges are cached for two seconds within a 4 MiB budget;
+edits invalidate the affected ranges. Debug builds log download response
+headers and sanitized body-read failures; release builds omit those debug
+diagnostics. Read-only requests retry transient 429, 5xx, and timeout failures
+up to twice. Transfer URLs must use HTTPS with valid TLS certificates.
 
 ## Creating and Editing Files
 
 Creating a file uploads an empty file first. Subsequent writes stage file
-contents in memory. Editing an existing file first downloads the entire file
-and refuses to stage it if that download is incomplete. Truncating to zero
-starts with an empty staged buffer; other truncations stage the existing
-contents before resizing.
+contents in a private temporary file. Editing an existing file downloads it
+in 1 MiB chunks and refuses to stage it if any chunk is incomplete. Truncating
+to zero starts with an empty temporary file; other truncations stage the
+existing contents before resizing.
 
 `flush`, `fsync`, and file release upload the staged contents with overwrite
-enabled. A successful upload replaces the in-memory remote entry and clears
-the staged buffer. A failed upload returns an I/O error and leaves the staged
-buffer available for a later attempt during the same mount. Buffering is
-unbounded in memory, and no edits survive process exit before a successful
-upload.
+enabled, streaming the staged file instead of copying it into memory. A
+successful upload replaces the in-memory remote entry and drops the temporary
+file. A failed upload leaves the staged file available for a later attempt
+during the same mount. A path-based truncate uploads before reporting success;
+pending edits do not survive process exit. Before staging and uploading, the
+mount checks remote size and modification time when available. This check is
+best-effort, not an atomic conditional write. Mutations are not automatically
+retried because their outcome may be ambiguous after a network failure.
 
 ## Directories and Mutations
 
@@ -54,12 +61,16 @@ upload.
 Replacement of an existing destination is not supported. Moving an item into
 the root requires the API client to infer MYBOX's root folder ID from a
 nonempty root listing; this fails if that listing is empty. Names must be
-valid UTF-8 and may not be empty, `.` or `..`, or contain `/`.
+valid UTF-8 and may not be empty, `.` or `..`, or contain `/` or NUL. Remote
+resource IDs are encoded as URL path segments. The mount uses fixed file and
+directory modes (`0644` and `0755`) and FUSE default permissions; it does not
+enable `allow_other`.
 
 ## Scope and Limitations
 
 The current implementation does not provide full POSIX semantics, special
-files, advanced ACLs, offline synchronization, bounded write storage,
-cross-mount cache invalidation, or automatic retry/backoff. Large-file edits
-require a full in-memory copy. Live-account behavior and the API response
-contract still require the smoke tests tracked in [`PLAN.md`](../PLAN.md).
+files, advanced ACLs, offline synchronization, atomic conflict detection,
+cross-mount cache invalidation, or bounded retained directory metadata. Large
+edits require enough local temporary disk space. Live-account behavior and
+the API response contract still require the smoke tests tracked in
+[`PLAN.md`](../PLAN.md).
