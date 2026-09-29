@@ -1,9 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     sync::Mutex,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use fuser::{
@@ -14,11 +16,13 @@ use fuser::{
 
 use crate::{
     Result,
-    api::{MyboxApiClient, RemoteDrive, RemoteEntry},
+    api::{ApiStatus, MyboxApiClient, RemoteDrive, RemoteEntry},
+    cache::ReadCache,
 };
 
 const ROOT_INODE: u64 = 1;
 const ATTR_TTL: Duration = Duration::from_secs(1);
+const DIRECTORY_TTL: Duration = Duration::from_secs(5);
 
 struct Node {
     inode: u64,
@@ -29,12 +33,12 @@ struct Node {
 struct NodeTable {
     nodes: HashMap<u64, Node>,
     children: HashMap<u64, Vec<u64>>,
-    dirty: HashMap<u64, Vec<u8>>,
+    dirty: HashMap<u64, File>,
     baselines: HashMap<u64, RemoteEntry>,
     open_files: HashMap<u64, u64>,
     lookups: HashMap<u64, u64>,
     unlinked: HashSet<u64>,
-    loaded_directories: HashSet<u64>,
+    loaded_directories: HashMap<u64, Instant>,
     next_inode: u64,
 }
 
@@ -48,7 +52,7 @@ impl NodeTable {
             open_files: HashMap::new(),
             lookups: HashMap::new(),
             unlinked: HashSet::new(),
-            loaded_directories: HashSet::new(),
+            loaded_directories: HashMap::new(),
             next_inode: ROOT_INODE + 1,
         }
     }
@@ -57,6 +61,7 @@ impl NodeTable {
 pub struct MyboxFs<D> {
     drive: D,
     nodes: Mutex<NodeTable>,
+    reads: Mutex<ReadCache>,
     uid: u32,
     gid: u32,
 }
@@ -66,6 +71,7 @@ impl<D: RemoteDrive> MyboxFs<D> {
         Self {
             drive,
             nodes: Mutex::new(NodeTable::new()),
+            reads: Mutex::new(ReadCache::default()),
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
         }
@@ -74,7 +80,11 @@ impl<D: RemoteDrive> MyboxFs<D> {
     fn ensure_children(&self, parent: u64) -> Result<()> {
         let folder_id = {
             let nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
-            if nodes.loaded_directories.contains(&parent) {
+            if nodes
+                .loaded_directories
+                .get(&parent)
+                .is_some_and(|expires| *expires > Instant::now())
+            {
                 return Ok(());
             }
             if parent == ROOT_INODE {
@@ -97,13 +107,49 @@ impl<D: RemoteDrive> MyboxFs<D> {
         };
 
         let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
-        if nodes.loaded_directories.contains(&parent) {
+        if nodes
+            .loaded_directories
+            .get(&parent)
+            .is_some_and(|expires| *expires > Instant::now())
+        {
             return Ok(());
         }
-
-        let child_inodes = entries
-            .into_iter()
-            .map(|entry| {
+        let old_children = nodes.children.get(&parent).cloned().unwrap_or_default();
+        let old_by_id: HashMap<_, _> = old_children
+            .iter()
+            .filter_map(|inode| {
+                nodes
+                    .nodes
+                    .get(inode)
+                    .map(|node| (node.entry.resource_id.clone(), *inode))
+            })
+            .collect();
+        let mut seen = HashSet::new();
+        let mut child_inodes = Vec::new();
+        for entry in entries {
+            if valid_name(OsStr::new(&entry.name)).is_err() || !seen.insert(entry.name.clone()) {
+                tracing::warn!("MYBOX listing contains an invalid or duplicate name");
+                continue;
+            }
+            if let Some(&inode) = old_by_id.get(&entry.resource_id) {
+                if !nodes.dirty.contains_key(&inode) {
+                    if !same_file_version(
+                        &nodes.nodes.get(&inode).ok_or("file inode not found")?.entry,
+                        &entry,
+                    ) {
+                        self.reads
+                            .lock()
+                            .map_err(|_| "read cache lock poisoned")?
+                            .invalidate(inode);
+                    }
+                    nodes
+                        .nodes
+                        .get_mut(&inode)
+                        .ok_or("file inode not found")?
+                        .entry = entry;
+                }
+                child_inodes.push(inode);
+            } else {
                 let inode = nodes.next_inode;
                 nodes.next_inode += 1;
                 nodes.nodes.insert(
@@ -114,11 +160,30 @@ impl<D: RemoteDrive> MyboxFs<D> {
                         entry,
                     },
                 );
-                inode
-            })
-            .collect();
+                child_inodes.push(inode);
+            }
+        }
+        for inode in old_children {
+            if !child_inodes.contains(&inode) {
+                if nodes.open_files.contains_key(&inode)
+                    || nodes.lookups.contains_key(&inode)
+                    || nodes.dirty.contains_key(&inode)
+                {
+                    continue;
+                }
+                nodes.nodes.remove(&inode);
+                nodes.children.remove(&inode);
+                nodes.loaded_directories.remove(&inode);
+                self.reads
+                    .lock()
+                    .map_err(|_| "read cache lock poisoned")?
+                    .invalidate(inode);
+            }
+        }
         nodes.children.insert(parent, child_inodes);
-        nodes.loaded_directories.insert(parent);
+        nodes
+            .loaded_directories
+            .insert(parent, Instant::now() + DIRECTORY_TTL);
         Ok(())
     }
 
@@ -139,8 +204,20 @@ impl<D: RemoteDrive> MyboxFs<D> {
             size,
             blocks: size.div_ceil(512),
             atime: SystemTime::UNIX_EPOCH,
-            mtime: SystemTime::UNIX_EPOCH,
-            ctime: SystemTime::UNIX_EPOCH,
+            mtime: node
+                .entry
+                .modified_at
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(SystemTime::from)
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+            ctime: node
+                .entry
+                .modified_at
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(SystemTime::from)
+                .unwrap_or(SystemTime::UNIX_EPOCH),
             crtime: SystemTime::UNIX_EPOCH,
             kind,
             perm: if node.entry.is_directory() {
@@ -203,6 +280,19 @@ impl<D: RemoteDrive> MyboxFs<D> {
         })
     }
 
+    fn refreshed_attr(&self, inode: u64) -> Result<Option<FileAttr>> {
+        if inode != ROOT_INODE {
+            let parent = {
+                let nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
+                nodes.nodes.get(&inode).map(|node| node.parent)
+            };
+            if let Some(parent) = parent {
+                self.ensure_children(parent)?;
+            }
+        }
+        Ok(self.attr(inode))
+    }
+
     fn directory_entries(&self, inode: u64) -> Result<Vec<(u64, FileType, String)>> {
         self.ensure_children(inode)?;
         let nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
@@ -256,16 +346,35 @@ impl<D: RemoteDrive> MyboxFs<D> {
                 return Err("cannot read a directory".into());
             }
             if let Some(data) = nodes.dirty.get(&inode) {
-                let start = usize::try_from(offset)
-                    .unwrap_or(usize::MAX)
-                    .min(data.len());
-                let end = start.saturating_add(size as usize).min(data.len());
-                return Ok(data[start..end].to_vec());
+                let mut data = data.try_clone()?;
+                let remaining = node.entry.size.saturating_sub(offset).min(size as u64);
+                data.seek(SeekFrom::Start(offset))?;
+                let mut bytes = Vec::new();
+                data.take(remaining).read_to_end(&mut bytes)?;
+                return Ok(bytes);
             }
             (node.entry.resource_id.clone(), node.entry.size)
         };
         let size = (file_size.saturating_sub(offset)).min(size as u64) as u32;
-        self.drive.download_file(&file_id, offset, size)
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(bytes) = self
+            .reads
+            .lock()
+            .map_err(|_| "read cache lock poisoned")?
+            .get(inode, offset, size)
+        {
+            return Ok(bytes);
+        }
+        let bytes = self.drive.download_file(&file_id, offset, size)?;
+        if bytes.len() == size as usize {
+            self.reads
+                .lock()
+                .map_err(|_| "read cache lock poisoned")?
+                .insert(inode, offset, bytes.clone());
+        }
+        Ok(bytes)
     }
 
     fn stage_file(&self, inode: u64) -> Result<()> {
@@ -281,12 +390,20 @@ impl<D: RemoteDrive> MyboxFs<D> {
         if !same_file_version(&node.entry, &remote) {
             return Err("MYBOX file changed remotely before editing".into());
         }
-        let size = u32::try_from(node.entry.size).map_err(|_| "file too large to edit")?;
-        let data = self.drive.download_file(&node.entry.resource_id, 0, size)?;
-        if data.len() != size as usize {
-            return Err("incomplete download; refusing to overwrite file".into());
+        let mut staged = tempfile::tempfile()?;
+        let mut offset = 0;
+        while offset < node.entry.size {
+            let size = (node.entry.size - offset).min(1024 * 1024) as u32;
+            let data = self
+                .drive
+                .download_file(&node.entry.resource_id, offset, size)?;
+            if data.len() != size as usize {
+                return Err("incomplete download; refusing to overwrite file".into());
+            }
+            staged.write_all(&data)?;
+            offset += size as u64;
         }
-        nodes.dirty.insert(inode, data);
+        nodes.dirty.insert(inode, staged);
         nodes.baselines.insert(inode, remote);
         Ok(())
     }
@@ -294,15 +411,23 @@ impl<D: RemoteDrive> MyboxFs<D> {
     fn write_file(&self, inode: u64, offset: u64, data: &[u8]) -> Result<u32> {
         self.stage_file(inode)?;
         let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
-        let start = usize::try_from(offset).map_err(|_| "write offset too large")?;
-        let end = start
-            .checked_add(data.len())
+        self.reads
+            .lock()
+            .map_err(|_| "read cache lock poisoned")?
+            .invalidate(inode);
+        let end = offset
+            .checked_add(data.len() as u64)
             .ok_or("write offset too large")?;
         let buffer = nodes.dirty.get_mut(&inode).ok_or("file not staged")?;
-        buffer.try_reserve(end.saturating_sub(buffer.len()))?;
-        buffer.resize(end.max(buffer.len()), 0);
-        buffer[start..end].copy_from_slice(data);
-        let len = buffer.len() as u64;
+        buffer.seek(SeekFrom::Start(offset))?;
+        buffer.write_all(data)?;
+        let len = nodes
+            .nodes
+            .get(&inode)
+            .ok_or("file inode not found")?
+            .entry
+            .size
+            .max(end);
         nodes
             .nodes
             .get_mut(&inode)
@@ -313,6 +438,10 @@ impl<D: RemoteDrive> MyboxFs<D> {
     }
 
     fn truncate_file(&self, inode: u64, size: u64) -> Result<FileAttr> {
+        self.reads
+            .lock()
+            .map_err(|_| "read cache lock poisoned")?
+            .invalidate(inode);
         if size == 0 {
             let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
             let node = nodes.nodes.get(&inode).ok_or("file inode not found")?;
@@ -326,17 +455,16 @@ impl<D: RemoteDrive> MyboxFs<D> {
                 }
                 nodes.baselines.insert(inode, remote);
             }
-            nodes.dirty.insert(inode, Vec::new());
+            let staged = tempfile::tempfile()?;
+            nodes.dirty.insert(inode, staged);
             let node = nodes.nodes.get_mut(&inode).ok_or("file inode not found")?;
             node.entry.size = 0;
             return Ok(self.entry_attr(node));
         }
         self.stage_file(inode)?;
         let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
-        let size = usize::try_from(size).map_err(|_| "file too large")?;
         let buffer = nodes.dirty.get_mut(&inode).ok_or("file not staged")?;
-        buffer.try_reserve(size.saturating_sub(buffer.len()))?;
-        buffer.resize(size, 0);
+        buffer.set_len(size)?;
         let node = nodes.nodes.get_mut(&inode).ok_or("file inode not found")?;
         node.entry.size = size as u64;
         Ok(self.entry_attr(node))
@@ -373,9 +501,14 @@ impl<D: RemoteDrive> MyboxFs<D> {
             .nodes
             .get(&node.parent)
             .map(|parent| parent.entry.resource_id.as_str());
-        let entry = self
-            .drive
-            .upload_file(parent_id, &node.entry.name, data.clone(), true)?;
+        let mut data = data.try_clone()?;
+        let entry = self.drive.upload_file(
+            parent_id,
+            &node.entry.name,
+            &mut data,
+            node.entry.size,
+            true,
+        )?;
         nodes
             .nodes
             .get_mut(&inode)
@@ -383,11 +516,15 @@ impl<D: RemoteDrive> MyboxFs<D> {
             .entry = entry;
         nodes.dirty.remove(&inode);
         nodes.baselines.remove(&inode);
+        self.reads
+            .lock()
+            .map_err(|_| "read cache lock poisoned")?
+            .invalidate(inode);
         Ok(())
     }
 
     fn create_file(&self, parent: u64, name: &OsStr) -> Result<FileAttr> {
-        let name = name.to_str().ok_or("file name is not UTF-8")?;
+        let name = valid_name(name).map_err(|_| "invalid file name")?;
         self.ensure_children(parent)?;
         let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
         if nodes
@@ -403,7 +540,9 @@ impl<D: RemoteDrive> MyboxFs<D> {
             .nodes
             .get(&parent)
             .map(|node| node.entry.resource_id.as_str());
-        let entry = self.drive.upload_file(parent_id, name, Vec::new(), false)?;
+        let entry =
+            self.drive
+                .upload_file(parent_id, name, &mut tempfile::tempfile()?, 0, false)?;
         let inode = nodes.next_inode;
         nodes.next_inode += 1;
         let node = Node {
@@ -440,6 +579,10 @@ impl<D: RemoteDrive> MyboxFs<D> {
         }
         let node = nodes.nodes.get(&inode).ok_or("file not found")?;
         self.drive.delete_file(&node.entry.resource_id)?;
+        self.reads
+            .lock()
+            .map_err(|_| "read cache lock poisoned")?
+            .invalidate(inode);
         nodes
             .children
             .get_mut(&parent)
@@ -516,7 +659,7 @@ impl<D: RemoteDrive> MyboxFs<D> {
         self.ensure_directory(parent)?;
         self.ensure_children(parent).map_err(|error| {
             tracing::warn!(%error, "MYBOX parent listing failed");
-            Errno::EIO
+            error_errno(error.as_ref())
         })?;
         let mut nodes = self.nodes.lock().map_err(|_| Errno::EIO)?;
         let parent_id = if parent == ROOT_INODE {
@@ -533,7 +676,7 @@ impl<D: RemoteDrive> MyboxFs<D> {
         }
         let entry = self.drive.create_folder(parent_id, name).map_err(|error| {
             tracing::warn!(%error, "MYBOX folder creation failed");
-            Errno::EIO
+            error_errno(error.as_ref())
         })?;
         let inode = nodes.next_inode;
         nodes.next_inode += 1;
@@ -546,7 +689,9 @@ impl<D: RemoteDrive> MyboxFs<D> {
         nodes.nodes.insert(inode, node);
         nodes.children.entry(parent).or_default().push(inode);
         nodes.children.insert(inode, Vec::new());
-        nodes.loaded_directories.insert(inode);
+        nodes
+            .loaded_directories
+            .insert(inode, Instant::now() + DIRECTORY_TTL);
         Ok(attr)
     }
 
@@ -578,14 +723,14 @@ impl<D: RemoteDrive> MyboxFs<D> {
             .resource_id;
         let remote_children = self.drive.list_children(resource_id).map_err(|error| {
             tracing::warn!(%error, "MYBOX folder listing failed before deletion");
-            Errno::EIO
+            error_errno(error.as_ref())
         })?;
         if !remote_children.is_empty() {
             return Err(Errno::ENOTEMPTY);
         }
         self.drive.delete_file(resource_id).map_err(|error| {
             tracing::warn!(%error, "MYBOX folder deletion failed");
-            Errno::EIO
+            error_errno(error.as_ref())
         })?;
         nodes
             .children
@@ -649,7 +794,7 @@ impl<D: RemoteDrive> MyboxFs<D> {
                 .move_resource(&resource_id, parent_id)
                 .map_err(|error| {
                     tracing::warn!(%error, "MYBOX resource move failed");
-                    Errno::EIO
+                    error_errno(error.as_ref())
                 })?;
             nodes
                 .children
@@ -668,7 +813,7 @@ impl<D: RemoteDrive> MyboxFs<D> {
                 .rename_resource(&resource_id, newname)
                 .map_err(|error| {
                     tracing::warn!(%error, "MYBOX resource rename failed after move");
-                    Errno::EIO
+                    error_errno(error.as_ref())
                 })?;
             nodes.nodes.get_mut(&inode).ok_or(Errno::EIO)?.entry.name = newname.to_owned();
         }
@@ -686,10 +831,31 @@ impl<D: RemoteDrive> MyboxFs<D> {
 
 fn valid_name(name: &OsStr) -> std::result::Result<&str, Errno> {
     let name = name.to_str().ok_or(Errno::EINVAL)?;
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
         return Err(Errno::EINVAL);
     }
     Ok(name)
+}
+
+fn error_errno(error: &(dyn std::error::Error + 'static)) -> Errno {
+    if let Some(status) = error.downcast_ref::<ApiStatus>() {
+        return match status.status.as_u16() {
+            400 => Errno::EINVAL,
+            401 | 403 => Errno::EACCES,
+            404 => Errno::ENOENT,
+            409 => Errno::EEXIST,
+            429 => Errno::EAGAIN,
+            507 => Errno::ENOSPC,
+            _ => Errno::EIO,
+        };
+    }
+    if error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_timeout)
+    {
+        return Errno::ETIMEDOUT;
+    }
+    Errno::EIO
 }
 
 fn same_file_version(cached: &RemoteEntry, current: &RemoteEntry) -> bool {
@@ -783,7 +949,7 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
             }
             Err(error) => {
                 tracing::warn!(%error, "MYBOX file creation lookup failed");
-                reply.error(Errno::EIO);
+                reply.error(error_errno(error.as_ref()));
                 return;
             }
             Ok(None) => {}
@@ -804,7 +970,7 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
             },
             Err(error) => {
                 tracing::warn!(%error, "MYBOX file creation failed");
-                reply.error(Errno::EIO);
+                reply.error(error_errno(error.as_ref()));
             }
         }
     }
@@ -821,7 +987,7 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
             }
             Err(error) => {
                 tracing::warn!(%error, "MYBOX file deletion lookup failed");
-                reply.error(Errno::EIO);
+                reply.error(error_errno(error.as_ref()));
                 return;
             }
             Ok(Some(_)) => {}
@@ -830,7 +996,7 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
             Ok(()) => reply.ok(),
             Err(error) => {
                 tracing::warn!(%error, "MYBOX file deletion failed");
-                reply.error(Errno::EIO);
+                reply.error(error_errno(error.as_ref()));
             }
         }
     }
@@ -877,7 +1043,7 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
             Ok(attr) => reply.attr(&ATTR_TTL, &attr),
             Err(error) => {
                 tracing::warn!(%error, "MYBOX attribute update failed");
-                reply.error(Errno::EIO);
+                reply.error(error_errno(error.as_ref()));
             }
         }
     }
@@ -898,7 +1064,7 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
             Ok(size) => reply.written(size),
             Err(error) => {
                 tracing::warn!(%error, "MYBOX file write failed");
-                reply.error(Errno::EIO);
+                reply.error(error_errno(error.as_ref()));
             }
         }
     }
@@ -915,7 +1081,7 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
             Ok(()) => reply.ok(),
             Err(error) => {
                 tracing::warn!(%error, "MYBOX file flush failed");
-                reply.error(Errno::EIO);
+                reply.error(error_errno(error.as_ref()));
             }
         }
     }
@@ -932,7 +1098,7 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
             Ok(()) => reply.ok(),
             Err(error) => {
                 tracing::warn!(%error, "MYBOX file sync failed");
-                reply.error(Errno::EIO);
+                reply.error(error_errno(error.as_ref()));
             }
         }
     }
@@ -953,7 +1119,7 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
             Ok(()) => reply.ok(),
             Err(error) => {
                 tracing::warn!(%error, "MYBOX file release failed");
-                reply.error(Errno::EIO);
+                reply.error(error_errno(error.as_ref()));
             }
         }
     }
@@ -967,15 +1133,19 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
             Ok(None) => reply.error(Errno::ENOENT),
             Err(error) => {
                 tracing::warn!(%error, "MYBOX lookup failed");
-                reply.error(Errno::EIO);
+                reply.error(error_errno(error.as_ref()));
             }
         }
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.attr(ino.0) {
-            Some(attr) => reply.attr(&ATTR_TTL, &attr),
-            None => reply.error(Errno::ENOENT),
+        match self.refreshed_attr(ino.0) {
+            Ok(Some(attr)) => reply.attr(&ATTR_TTL, &attr),
+            Ok(None) => reply.error(Errno::ENOENT),
+            Err(error) => {
+                tracing::warn!(%error, "MYBOX attribute refresh failed");
+                reply.error(error_errno(error.as_ref()));
+            }
         }
     }
 
@@ -1007,7 +1177,7 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
             }
             Err(error) => {
                 tracing::warn!(%error, "MYBOX directory listing failed");
-                reply.error(Errno::EIO);
+                reply.error(error_errno(error.as_ref()));
             }
         }
     }
@@ -1027,7 +1197,7 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
             Ok(bytes) => reply.data(&bytes),
             Err(error) => {
                 tracing::warn!(%error, "MYBOX file read failed");
-                reply.error(Errno::EIO);
+                reply.error(error_errno(error.as_ref()));
             }
         }
     }
@@ -1139,14 +1309,21 @@ mod tests {
             &self,
             parent_id: Option<&str>,
             name: &str,
-            data: Vec<u8>,
+            data: &mut File,
+            size: u64,
             overwrite: bool,
         ) -> Result<RemoteEntry> {
             if *self.fail_upload.lock().unwrap() {
                 return Err("upload failed".into());
             }
+            data.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            data.read_to_end(&mut bytes)?;
+            if bytes.len() as u64 != size {
+                return Err("incomplete staged upload".into());
+            }
             let id = format!("file-{name}");
-            let entry = entry(&id, name, data.len() as u64, "file");
+            let entry = entry(&id, name, size, "file");
             let mut root = self.root.lock().unwrap();
             let mut children = self.children.lock().unwrap();
             let siblings = match parent_id {
@@ -1161,7 +1338,7 @@ mod tests {
             } else {
                 siblings.push(entry.clone());
             }
-            self.files.lock().unwrap().insert(id, data);
+            self.files.lock().unwrap().insert(id, bytes);
             Ok(entry)
         }
         fn delete_file(&self, file_id: &str) -> Result<()> {
@@ -1305,11 +1482,169 @@ mod tests {
         assert!(filesystem.read_file(hello.ino.0, 11, 8).unwrap().is_empty());
         assert_eq!(
             *filesystem.drive.downloads.lock().unwrap(),
+            vec![("file-1".into(), 6, 3), ("file-1".into(), 10, 1)]
+        );
+    }
+
+    #[test]
+    fn caches_clean_reads_and_invalidates_on_write() {
+        let filesystem = filesystem();
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(filesystem.read_file(file.ino.0, 0, 5).unwrap(), b"hello");
+        assert_eq!(filesystem.read_file(file.ino.0, 1, 3).unwrap(), b"ell");
+        assert_eq!(filesystem.drive.downloads.lock().unwrap().len(), 1);
+        filesystem.write_file(file.ino.0, 0, b"H").unwrap();
+        filesystem.flush_file(file.ino.0).unwrap();
+        assert_eq!(filesystem.read_file(file.ino.0, 0, 5).unwrap(), b"Hello");
+        assert_eq!(filesystem.drive.downloads.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn refreshes_directory_without_changing_existing_inodes() {
+        let filesystem = filesystem();
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        filesystem
+            .drive
+            .root
+            .lock()
+            .unwrap()
+            .push(entry("file-new", "new.txt", 4, "file"));
+        filesystem
+            .drive
+            .files
+            .lock()
+            .unwrap()
+            .insert("file-new".into(), b"new!".to_vec());
+        filesystem
+            .nodes
+            .lock()
+            .unwrap()
+            .loaded_directories
+            .insert(ROOT_INODE, Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            filesystem
+                .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+                .unwrap()
+                .unwrap()
+                .ino,
+            file.ino
+        );
+        assert!(
+            filesystem
+                .lookup_entry(ROOT_INODE, OsStr::new("new.txt"))
+                .unwrap()
+                .is_some()
+        );
+        filesystem
+            .drive
+            .root
+            .lock()
+            .unwrap()
+            .retain(|entry| entry.resource_id != "file-new");
+        filesystem
+            .nodes
+            .lock()
+            .unwrap()
+            .loaded_directories
+            .insert(ROOT_INODE, Instant::now() - Duration::from_secs(1));
+        assert!(
+            filesystem
+                .lookup_entry(ROOT_INODE, OsStr::new("new.txt"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remote_modification_time_invalidates_cached_bytes() {
+        let filesystem = filesystem();
+        filesystem.drive.root.lock().unwrap()[1].modified_at = Some("2024-01-01T00:00:00Z".into());
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(file.mtime, SystemTime::UNIX_EPOCH);
+        assert_eq!(filesystem.read_file(file.ino.0, 0, 5).unwrap(), b"hello");
+        filesystem
+            .drive
+            .files
+            .lock()
+            .unwrap()
+            .insert("file-1".into(), b"HELLO world".to_vec());
+        filesystem.drive.root.lock().unwrap()[1].modified_at = Some("2024-01-02T00:00:00Z".into());
+        filesystem
+            .nodes
+            .lock()
+            .unwrap()
+            .loaded_directories
+            .insert(ROOT_INODE, Instant::now() - Duration::from_secs(1));
+        let refreshed = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.ino, file.ino);
+        assert_ne!(refreshed.mtime, file.mtime);
+        assert_eq!(filesystem.read_file(file.ino.0, 0, 5).unwrap(), b"HELLO");
+        assert_eq!(filesystem.drive.downloads.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn stages_large_files_in_bounded_downloads() {
+        let filesystem = filesystem();
+        let size = 1024 * 1024 + 3;
+        filesystem
+            .drive
+            .files
+            .lock()
+            .unwrap()
+            .insert("file-1".into(), vec![b'a'; size]);
+        filesystem.drive.root.lock().unwrap()[1].size = size as u64;
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        filesystem
+            .write_file(file.ino.0, size as u64 - 1, b"z")
+            .unwrap();
+        assert_eq!(
+            *filesystem.drive.downloads.lock().unwrap(),
             vec![
-                ("file-1".into(), 6, 3),
-                ("file-1".into(), 10, 1),
-                ("file-1".into(), 11, 0)
+                ("file-1".into(), 0, 1024 * 1024),
+                ("file-1".into(), 1024 * 1024, 3)
             ]
+        );
+        filesystem.flush_file(file.ino.0).unwrap();
+        assert_eq!(
+            filesystem.drive.files.lock().unwrap()["file-hello.txt"][size - 1],
+            b'z'
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_names_and_maps_http_errors() {
+        assert!(valid_name(OsStr::new("bad/name")).is_err());
+        assert!(valid_name(OsStr::new("bad\0name")).is_err());
+        assert_eq!(
+            error_errno(
+                crate::api::status_error("test", reqwest::StatusCode::TOO_MANY_REQUESTS)
+                    .unwrap_err()
+                    .as_ref()
+            ),
+            Errno::EAGAIN
+        );
+        assert_eq!(
+            error_errno(
+                crate::api::status_error("test", reqwest::StatusCode::NOT_FOUND)
+                    .unwrap_err()
+                    .as_ref()
+            ),
+            Errno::ENOENT
         );
     }
 

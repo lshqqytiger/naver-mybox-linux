@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 fuser = "0.18"
 libc = "0.2"
 rpassword = "7.4"
@@ -15,5 +16,6 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ] }
 serde = { version = "1", features = ["derive"] }
+tempfile = "3"
 tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
