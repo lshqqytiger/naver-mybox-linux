@@ -1,91 +1,72 @@
-# PLAN
+# Implementation Plan
 
-## Goal
+## Goal and Scope
 
-Build a Rust-based Linux adapter that mounts NAVER MYBOX storage as a filesystem device by using the official MYBOX OpenAPI:
-<https://developers.mybox.naver.com/>
+Mount NAVER MYBOX on Linux using the [official OpenAPI](https://developers.mybox.naver.com/).
+Support browsing, reading, creating, editing, deleting, moving, and renaming files and folders.
+Use personal access tokens and FUSE; full POSIX semantics, special files, advanced ACLs,
+and offline synchronization are out of scope for the first release.
 
-## Implementation Plan
+Complete the steps in order. Check a step only after its verification criteria pass.
 
-### 1) Scope and Requirements
+## 1. Establish the Current Baseline
 
-- [ ] Target modern Linux distributions with FUSE support.
-- [ ] Mount MYBOX into a local directory and support common file operations (`ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`).
-- [ ] Keep full POSIX compatibility (special files, hard links, advanced ACLs) out of the first release.
-- [ ] Keep an offline synchronization daemon out of the first release.
+- [x] Provide `login`, `health-check`, `mount`, and `unmount` commands with owner-only token storage.
+- [x] Mount with FUSE and map remote entries to in-memory inodes and file attributes.
+- [x] Browse directories and read requested byte ranges from files.
+- [x] Create, edit, truncate, and delete files; stage writes in memory and upload on flush/close.
+- [x] Add debug-build-only download diagnostics and unit tests for the local file lifecycle.
 
-### 2) High-Level Architecture
+Verification: `cargo test`, `cargo fmt --check`, and `cargo check --release` pass.
 
-- [x] **CLI Layer:** Provide `myboxfs mount <mountpoint>`, `myboxfs unmount <mountpoint>`, and `myboxfs login` / token management helpers.
-- [ ] **FUSE Filesystem Layer:** Implement core FUSE operations (`lookup`, `getattr`, `readdir`, `open`, `read`, `write`, `create`, `unlink`, `rename`, `mkdir`, `rmdir`, `flush`, `release`).
-- [ ] **MYBOX API Client Layer:** Build a typed Rust client for OpenAPI endpoints with request retries, timeout handling, and error mapping.
-- [ ] **Auth/Token Layer:** Implement the OAuth/OpenAPI token acquisition flow, secure local token storage, and token refresh flow.
-- [ ] **Metadata & Cache Layer:** Implement in-memory inode/path mapping, directory listing and attribute caches with TTL, and an optional temporary file cache for write-back.
+## 2. Verify the Existing Workflow Against MYBOX
 
-### 3) Suggested Rust Crates
+- [ ] With a test account, mount and unmount; browse root and nested directories.
+- [ ] Read small and large files, including nonzero offsets; check whether the download server honors HTTP Range and whether reads time out.
+- [ ] Create an empty file, upload a new file, overwrite and truncate an existing file, then delete a file to trash. Verify content and listings after remounting.
+- [ ] Record actual API response shapes and error statuses; fix mismatches before adding more operations.
 
-- [x] Use `fuser` for FUSE integration.
-- [ ] Use `tokio` and `reqwest` for the async runtime and HTTP client.
-- [x] Use `serde` with reqwest's JSON support for API responses.
-- [ ] Use `thiserror` and/or `anyhow` for error handling.
-- [x] Use `tracing` and `tracing-subscriber` for logging.
-- [x] Use `clap` for CLI parsing.
-- [ ] Use `keyring` or an encrypted local file approach for credential storage.
+Verification: a real-account smoke run completes without lost data or stale entries. Never put tokens or signed URLs in test logs.
 
-### 4) Data and Operation Design
+## 3. Add Deterministic API and FUSE Tests
 
-- [x] Manage path-to-inode mapping in adapter memory.
-- [ ] Translate remote object metadata into Linux file attributes (size, mtime, file/directory type, and synthetic default permissions).
-- [x] For reads, resolve the inode/path, fetch data from the MYBOX API, and return the requested byte range.
-- [ ] For writes, buffer data or use a temporary file, upload on `flush`/`release` (or use chunked upload if supported), and invalidate parent directory and file attribute caches.
+- [ ] Mock the MYBOX upload-URL, multipart upload, metadata listing, download, and delete requests; assert request methods, bodies, and failure handling.
+- [ ] Test mount-level create, read, write, truncate, and unlink flows in a FUSE-capable CI/container environment.
+- [ ] Cover duplicate names, missing files, interrupted transfers, retries after flush failure, and inode/listing consistency.
 
-### 5) Error Handling and Reliability
+Verification: tests run without MYBOX credentials and catch remote API contract changes.
 
-- [ ] Map API and network failures consistently to Linux errno values.
-- [ ] Implement exponential backoff for transient errors (429, 5xx, and timeouts).
-- [ ] Add request correlation IDs to logs.
-- [ ] Ensure graceful unmount on fatal runtime errors.
+## 4. Finish Filesystem Operations
 
-### 6) Security Plan
+- [ ] Implement folder creation and removal (`mkdir`, `rmdir`) with correct empty-folder and error behavior.
+- [ ] Implement rename and move for files and folders, including cross-directory moves and collision rules.
+- [ ] Update in-memory parent/child mappings after each successful remote mutation; preserve local state on failure.
+- [ ] Return appropriate Linux errors for unsupported operations, missing entries, conflicts, and permission failures.
 
-- [ ] Never log access tokens or sensitive headers.
-- [ ] Store tokens securely, preferring the system keyring.
-- [ ] Enforce HTTPS and validate certificates.
-- [ ] Validate and sanitize paths to prevent traversal bugs.
+Verification: `mkdir`, `rmdir`, `mv`, `rm`, `cp`, `cat`, and `ls` work in the mocked mount and a real-account smoke run.
 
-### 7) Development Milestones
+## 5. Harden Writes and Network Failures
 
-- [ ] **MVP Mount (Read-Only)**
-  - [x] Implement login/token loading.
-  - [x] Implement `getattr`, `readdir`, `open`, and `read`.
-  - [ ] Verify file reads against the live MYBOX API after the range-read change.
-- [ ] **Read-Write Support**
-  - [x] Implement file `create`, `write`, `flush`, and `unlink` with upload on flush/close.
-  - [ ] Implement `rename`, `mkdir`, and `rmdir`.
-  - [ ] Verify create, edit, and delete against a live MYBOX account.
-- [ ] **Caching & Performance**
-  - [ ] Tune attribute and directory cache TTLs.
-  - [ ] Improve large-file reads and writes (range/chunk support; ranged reads implemented, live verification pending).
-- [ ] **Hardening**
-  - [ ] Add retry policies, robust error mapping, and better observability.
-- [ ] **Packaging**
-  - [ ] Build and release binaries and provide distro installation guidance.
+- [ ] Replace whole-file in-memory edit buffers with bounded temporary storage or chunked uploads where the API supports them.
+- [ ] Define persistence semantics for concurrent open handles, `fsync`, `flush`, and failed close; prevent a failed upload from silently losing edits.
+- [ ] Map API/network failures to errno consistently and retry only safe transient requests (429, 5xx, timeouts) with bounded backoff.
+- [ ] Track file size and modification time from remote metadata; invalidate directory and attribute caches after mutations.
 
-### 8) Testing Strategy
+Verification: large-file edits, concurrent writes, interrupted uploads, and remounts retain the expected content and metadata.
 
-- [ ] **Unit tests:** Cover path/inode translation, API response mapping, and cache invalidation logic.
-- [ ] **Integration tests:** Use a mocked MYBOX API server for deterministic FUSE behavior and test mounting plus basic filesystem operations in CI/container.
-- [ ] **Manual validation:** Run real-account smoke tests (`mount`, browse, upload, rename, delete, unmount).
+## 6. Improve Performance and Security
 
-### 9) Operational Considerations
+- [ ] Add bounded data and metadata caches with TTL and explicit invalidation; measure directory and large-file behavior before tuning.
+- [ ] Keep token and signed URL values out of logs; require HTTPS for API-provided transfer URLs and validate certificates.
+- [ ] Validate remote names and path handling, enforce mount permissions, and document token storage and recovery.
+- [ ] Add useful request correlation and latency diagnostics without exposing file contents or credentials.
 
-- [ ] Use `~/.config/myboxfs/config.toml` as the config file location.
-- [x] Provide structured logs for troubleshooting (download diagnostics are debug-build-only).
-- [ ] Consider an optional metrics endpoint for request latency and cache hit ratios.
+Verification: repeated reads avoid unnecessary transfers, mutations invalidate stale data, and security checks pass for malformed inputs.
 
-## Immediate Next Steps
+## 7. Package and Release
 
-- [x] Initialize the Rust project structure (`cli`, `fuse`, `api`, `auth`, `cache` modules).
-- [x] Implement token entry/loading and a minimal API health check command.
-- [x] Deliver the first read-only FUSE mount prototype and validate it with basic file listing.
-- [ ] Confirm ranged reads of large files against MYBOX and whether its download server honors HTTP Range.
+- [ ] Run unit, mocked API, and FUSE integration tests in CI; document the Linux FUSE prerequisites.
+- [ ] Publish reproducible release builds and distro installation/uninstallation guidance.
+- [ ] Document supported operations, known limitations, troubleshooting, and a final real-account smoke-test procedure.
+
+Verification: a fresh supported Linux machine can install, authenticate, mount, perform supported operations, and unmount successfully.
