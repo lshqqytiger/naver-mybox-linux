@@ -8,7 +8,8 @@ use std::{
 
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request,
+    MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 
 use crate::{
@@ -28,6 +29,7 @@ struct Node {
 struct NodeTable {
     nodes: HashMap<u64, Node>,
     children: HashMap<u64, Vec<u64>>,
+    dirty: HashMap<u64, Vec<u8>>,
     loaded_directories: HashSet<u64>,
     next_inode: u64,
 }
@@ -37,6 +39,7 @@ impl NodeTable {
         Self {
             nodes: HashMap::new(),
             children: HashMap::new(),
+            dirty: HashMap::new(),
             loaded_directories: HashSet::new(),
             next_inode: ROOT_INODE + 1,
         }
@@ -133,9 +136,9 @@ impl<D: RemoteDrive> MyboxFs<D> {
             crtime: SystemTime::UNIX_EPOCH,
             kind,
             perm: if node.entry.is_directory() {
-                0o555
+                0o755
             } else {
-                0o444
+                0o644
             },
             nlink: if node.entry.is_directory() { 2 } else { 1 },
             uid: self.uid,
@@ -156,7 +159,7 @@ impl<D: RemoteDrive> MyboxFs<D> {
             ctime: SystemTime::UNIX_EPOCH,
             crtime: SystemTime::UNIX_EPOCH,
             kind: FileType::Directory,
-            perm: 0o555,
+            perm: 0o755,
             nlink: 2,
             uid: self.uid,
             gid: self.gid,
@@ -217,14 +220,326 @@ impl<D: RemoteDrive> MyboxFs<D> {
             if node.entry.is_directory() {
                 return Err("cannot read a directory".into());
             }
+            if let Some(data) = nodes.dirty.get(&inode) {
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(data.len());
+                let end = start.saturating_add(size as usize).min(data.len());
+                return Ok(data[start..end].to_vec());
+            }
             (node.entry.resource_id.clone(), node.entry.size)
         };
         let size = (file_size.saturating_sub(offset)).min(size as u64) as u32;
         self.drive.download_file(&file_id, offset, size)
     }
+
+    fn stage_file(&self, inode: u64) -> Result<()> {
+        let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
+        if nodes.dirty.contains_key(&inode) {
+            return Ok(());
+        }
+        let node = nodes.nodes.get(&inode).ok_or("file inode not found")?;
+        if node.entry.is_directory() {
+            return Err("cannot write a directory".into());
+        }
+        let size = u32::try_from(node.entry.size).map_err(|_| "file too large to edit")?;
+        let data = self.drive.download_file(&node.entry.resource_id, 0, size)?;
+        if data.len() != size as usize {
+            return Err("incomplete download; refusing to overwrite file".into());
+        }
+        nodes.dirty.insert(inode, data);
+        Ok(())
+    }
+
+    fn write_file(&self, inode: u64, offset: u64, data: &[u8]) -> Result<u32> {
+        self.stage_file(inode)?;
+        let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
+        let start = usize::try_from(offset).map_err(|_| "write offset too large")?;
+        let end = start
+            .checked_add(data.len())
+            .ok_or("write offset too large")?;
+        let buffer = nodes.dirty.get_mut(&inode).ok_or("file not staged")?;
+        buffer.try_reserve(end.saturating_sub(buffer.len()))?;
+        buffer.resize(end.max(buffer.len()), 0);
+        buffer[start..end].copy_from_slice(data);
+        let len = buffer.len() as u64;
+        nodes
+            .nodes
+            .get_mut(&inode)
+            .ok_or("file inode not found")?
+            .entry
+            .size = len;
+        Ok(data.len() as u32)
+    }
+
+    fn truncate_file(&self, inode: u64, size: u64) -> Result<FileAttr> {
+        if size == 0 {
+            let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
+            let node = nodes.nodes.get(&inode).ok_or("file inode not found")?;
+            if node.entry.is_directory() {
+                return Err("cannot truncate a directory".into());
+            }
+            nodes.dirty.insert(inode, Vec::new());
+            let node = nodes.nodes.get_mut(&inode).ok_or("file inode not found")?;
+            node.entry.size = 0;
+            return Ok(self.entry_attr(node));
+        }
+        self.stage_file(inode)?;
+        let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
+        let size = usize::try_from(size).map_err(|_| "file too large")?;
+        let buffer = nodes.dirty.get_mut(&inode).ok_or("file not staged")?;
+        buffer.try_reserve(size.saturating_sub(buffer.len()))?;
+        buffer.resize(size, 0);
+        let node = nodes.nodes.get_mut(&inode).ok_or("file inode not found")?;
+        node.entry.size = size as u64;
+        Ok(self.entry_attr(node))
+    }
+
+    fn flush_file(&self, inode: u64) -> Result<()> {
+        let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
+        let Some(data) = nodes.dirty.get(&inode) else {
+            return Ok(());
+        };
+        let node = nodes.nodes.get(&inode).ok_or("file inode not found")?;
+        let parent_id = nodes
+            .nodes
+            .get(&node.parent)
+            .map(|parent| parent.entry.resource_id.as_str());
+        let entry = self
+            .drive
+            .upload_file(parent_id, &node.entry.name, data.clone(), true)?;
+        nodes
+            .nodes
+            .get_mut(&inode)
+            .ok_or("file inode not found")?
+            .entry = entry;
+        nodes.dirty.remove(&inode);
+        Ok(())
+    }
+
+    fn create_file(&self, parent: u64, name: &OsStr) -> Result<FileAttr> {
+        let name = name.to_str().ok_or("file name is not UTF-8")?;
+        self.ensure_children(parent)?;
+        let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
+        if nodes
+            .children
+            .get(&parent)
+            .into_iter()
+            .flatten()
+            .any(|inode| nodes.nodes[inode].entry.name == name)
+        {
+            return Err("file already exists".into());
+        }
+        let parent_id = nodes
+            .nodes
+            .get(&parent)
+            .map(|node| node.entry.resource_id.as_str());
+        let entry = self.drive.upload_file(parent_id, name, Vec::new(), false)?;
+        let inode = nodes.next_inode;
+        nodes.next_inode += 1;
+        let node = Node {
+            inode,
+            parent,
+            entry,
+        };
+        let attr = self.entry_attr(&node);
+        nodes.nodes.insert(inode, node);
+        nodes.children.entry(parent).or_default().push(inode);
+        Ok(attr)
+    }
+
+    fn unlink_file(&self, parent: u64, name: &OsStr) -> Result<()> {
+        self.ensure_children(parent)?;
+        let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
+        let inode = *nodes
+            .children
+            .get(&parent)
+            .ok_or("parent not found")?
+            .iter()
+            .find(|inode| nodes.nodes[inode].entry.name == name.to_string_lossy())
+            .ok_or("file not found")?;
+        let node = nodes.nodes.get(&inode).ok_or("file not found")?;
+        if node.entry.is_directory() {
+            return Err("cannot unlink a directory".into());
+        }
+        self.drive.delete_file(&node.entry.resource_id)?;
+        nodes
+            .children
+            .get_mut(&parent)
+            .ok_or("parent not found")?
+            .retain(|child| *child != inode);
+        nodes.nodes.remove(&inode);
+        nodes.dirty.remove(&inode);
+        Ok(())
+    }
 }
 
 impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        match self.lookup_entry(parent.0, name) {
+            Ok(Some(_)) => {
+                reply.error(Errno::EEXIST);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "MYBOX file creation lookup failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+            Ok(None) => {}
+        }
+        match self.create_file(parent.0, name) {
+            Ok(attr) => reply.created(
+                &ATTR_TTL,
+                &attr,
+                Generation(0),
+                FileHandle(0),
+                FopenFlags::empty(),
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "MYBOX file creation failed");
+                reply.error(Errno::EIO);
+            }
+        }
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.lookup_entry(parent.0, name) {
+            Ok(None) => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            Ok(Some(attr)) if attr.kind == FileType::Directory => {
+                reply.error(Errno::EISDIR);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "MYBOX file deletion lookup failed");
+                reply.error(Errno::EIO);
+                return;
+            }
+            Ok(Some(_)) => {}
+        }
+        match self.unlink_file(parent.0, name) {
+            Ok(()) => reply.ok(),
+            Err(error) => {
+                tracing::warn!(%error, "MYBOX file deletion failed");
+                reply.error(Errno::EIO);
+            }
+        }
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let attr = match size {
+            Some(size) => self.truncate_file(ino.0, size).ok(),
+            None => self.attr(ino.0),
+        };
+        match attr {
+            Some(attr) => reply.attr(&ATTR_TTL, &attr),
+            None => reply.error(Errno::EIO),
+        }
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        match self.write_file(ino.0, offset, data) {
+            Ok(size) => reply.written(size),
+            Err(error) => {
+                tracing::warn!(%error, "MYBOX file write failed");
+                reply.error(Errno::EIO);
+            }
+        }
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        match self.flush_file(ino.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => {
+                tracing::warn!(%error, "MYBOX file flush failed");
+                reply.error(Errno::EIO);
+            }
+        }
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.flush_file(ino.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => {
+                tracing::warn!(%error, "MYBOX file sync failed");
+                reply.error(Errno::EIO);
+            }
+        }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.flush_file(ino.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => {
+                tracing::warn!(%error, "MYBOX file release failed");
+                reply.error(Errno::EIO);
+            }
+        }
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.lookup_entry(parent.0, name) {
             Ok(Some(attr)) => reply.entry(&ATTR_TTL, &attr, Generation(0)),
@@ -320,7 +635,10 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
 pub fn mount(mountpoint: &Path, access_token: String) -> Result<()> {
     let filesystem = MyboxFs::new(MyboxApiClient::new(access_token));
     let mut config = Config::default();
-    config.mount_options = vec![MountOption::RO, MountOption::FSName("myboxfs".into())];
+    config.mount_options = vec![
+        MountOption::DefaultPermissions,
+        MountOption::FSName("myboxfs".into()),
+    ];
     fuser::mount(filesystem, mountpoint, &config)?;
     Ok(())
 }
@@ -350,28 +668,80 @@ mod tests {
 
     #[derive(Default)]
     struct FakeDrive {
-        root: Vec<RemoteEntry>,
-        children: HashMap<String, Vec<RemoteEntry>>,
-        files: HashMap<String, Vec<u8>>,
+        root: Mutex<Vec<RemoteEntry>>,
+        children: Mutex<HashMap<String, Vec<RemoteEntry>>>,
+        files: Mutex<HashMap<String, Vec<u8>>>,
         downloads: Mutex<Vec<(String, u64, u32)>>,
+        fail_upload: Mutex<bool>,
+        fail_delete: Mutex<bool>,
     }
 
     impl RemoteDrive for FakeDrive {
         fn list_root(&self) -> Result<Vec<RemoteEntry>> {
-            Ok(self.root.clone())
+            Ok(self.root.lock().unwrap().clone())
         }
         fn list_children(&self, folder_id: &str) -> Result<Vec<RemoteEntry>> {
-            Ok(self.children.get(folder_id).cloned().unwrap_or_default())
+            Ok(self
+                .children
+                .lock()
+                .unwrap()
+                .get(folder_id)
+                .cloned()
+                .unwrap_or_default())
         }
         fn download_file(&self, file_id: &str, offset: u64, size: u32) -> Result<Vec<u8>> {
             self.downloads
                 .lock()
                 .unwrap()
                 .push((file_id.to_owned(), offset, size));
-            let file = self.files.get(file_id).ok_or("missing test file")?;
+            let files = self.files.lock().unwrap();
+            let file = files.get(file_id).ok_or("missing test file")?;
             let start = (offset as usize).min(file.len());
             let end = start.saturating_add(size as usize).min(file.len());
             Ok(file[start..end].to_vec())
+        }
+        fn upload_file(
+            &self,
+            parent_id: Option<&str>,
+            name: &str,
+            data: Vec<u8>,
+            overwrite: bool,
+        ) -> Result<RemoteEntry> {
+            if *self.fail_upload.lock().unwrap() {
+                return Err("upload failed".into());
+            }
+            let id = format!("file-{name}");
+            let entry = entry(&id, name, data.len() as u64, "file");
+            let mut root = self.root.lock().unwrap();
+            let mut children = self.children.lock().unwrap();
+            let siblings = match parent_id {
+                Some(parent_id) => children.entry(parent_id.to_owned()).or_default(),
+                None => &mut root,
+            };
+            if let Some(existing) = siblings.iter_mut().find(|existing| existing.name == name) {
+                if !overwrite {
+                    return Err("file exists".into());
+                }
+                *existing = entry.clone();
+            } else {
+                siblings.push(entry.clone());
+            }
+            self.files.lock().unwrap().insert(id, data);
+            Ok(entry)
+        }
+        fn delete_file(&self, file_id: &str) -> Result<()> {
+            if *self.fail_delete.lock().unwrap() {
+                return Err("delete failed".into());
+            }
+            self.root
+                .lock()
+                .unwrap()
+                .retain(|entry| entry.resource_id != file_id);
+            for entries in self.children.lock().unwrap().values_mut() {
+                entries.retain(|entry| entry.resource_id != file_id);
+            }
+            self.files.lock().unwrap().remove(file_id);
+            Ok(())
         }
     }
 
@@ -386,19 +756,21 @@ mod tests {
 
     fn filesystem() -> MyboxFs<FakeDrive> {
         MyboxFs::new(FakeDrive {
-            root: vec![
+            root: Mutex::new(vec![
                 entry("folder-1", "Documents", 0, "folder"),
                 entry("file-1", "hello.txt", 11, "file"),
-            ],
-            children: HashMap::from([(
+            ]),
+            children: Mutex::new(HashMap::from([(
                 "folder-1".into(),
                 vec![entry("file-2", "notes.txt", 5, "file")],
-            )]),
-            files: HashMap::from([
+            )])),
+            files: Mutex::new(HashMap::from([
                 ("file-1".into(), b"hello world".to_vec()),
                 ("file-2".into(), b"notes".to_vec()),
-            ]),
+            ])),
             downloads: Mutex::new(Vec::new()),
+            fail_upload: Mutex::new(false),
+            fail_delete: Mutex::new(false),
         })
     }
 
@@ -415,10 +787,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(documents.kind, FileType::Directory);
-        assert_eq!(documents.perm, 0o555);
+        assert_eq!(documents.perm, 0o755);
         assert_eq!(hello.kind, FileType::RegularFile);
         assert_eq!(hello.size, 11);
-        assert_eq!(hello.perm, 0o444);
+        assert_eq!(hello.perm, 0o644);
 
         let children = filesystem.directory_entries(documents.ino.0).unwrap();
         assert_eq!(
@@ -445,6 +817,160 @@ mod tests {
                 ("file-1".into(), 10, 1),
                 ("file-1".into(), 11, 0)
             ]
+        );
+    }
+
+    #[test]
+    fn creates_writes_flushes_and_deletes_files() {
+        let filesystem = filesystem();
+        let documents = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("Documents"))
+            .unwrap()
+            .unwrap();
+        let created = filesystem
+            .create_file(documents.ino.0, OsStr::new("draft.txt"))
+            .unwrap();
+        assert_eq!(created.size, 0);
+        assert_eq!(
+            filesystem.write_file(created.ino.0, 0, b"hello").unwrap(),
+            5
+        );
+        assert_eq!(
+            filesystem.write_file(created.ino.0, 6, b"world").unwrap(),
+            5
+        );
+        assert_eq!(
+            filesystem.read_file(created.ino.0, 0, 20).unwrap(),
+            b"hello\0world"
+        );
+        assert_eq!(filesystem.attr(created.ino.0).unwrap().size, 11);
+        filesystem.flush_file(created.ino.0).unwrap();
+        assert_eq!(
+            filesystem.read_file(created.ino.0, 0, 20).unwrap(),
+            b"hello\0world"
+        );
+        assert_eq!(
+            filesystem
+                .lookup_entry(documents.ino.0, OsStr::new("draft.txt"))
+                .unwrap()
+                .unwrap()
+                .ino,
+            created.ino
+        );
+
+        filesystem.truncate_file(created.ino.0, 3).unwrap();
+        filesystem.flush_file(created.ino.0).unwrap();
+        assert_eq!(filesystem.read_file(created.ino.0, 0, 20).unwrap(), b"hel");
+        filesystem
+            .unlink_file(documents.ino.0, OsStr::new("draft.txt"))
+            .unwrap();
+        assert!(
+            filesystem
+                .lookup_entry(documents.ino.0, OsStr::new("draft.txt"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(filesystem.attr(created.ino.0).is_none());
+    }
+
+    #[test]
+    fn modifies_existing_file_without_discarding_other_bytes() {
+        let filesystem = filesystem();
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        filesystem.write_file(file.ino.0, 6, b"rust!").unwrap();
+        assert_eq!(
+            filesystem.read_file(file.ino.0, 0, 20).unwrap(),
+            b"hello rust!"
+        );
+        filesystem.flush_file(file.ino.0).unwrap();
+        assert_eq!(
+            filesystem.read_file(file.ino.0, 0, 20).unwrap(),
+            b"hello rust!"
+        );
+        filesystem
+            .unlink_file(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap();
+        assert!(
+            filesystem
+                .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failed_upload_and_delete_keep_local_state() {
+        let filesystem = filesystem();
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        filesystem.write_file(file.ino.0, 0, b"H").unwrap();
+        *filesystem.drive.fail_upload.lock().unwrap() = true;
+        assert!(filesystem.flush_file(file.ino.0).is_err());
+        assert_eq!(
+            filesystem.read_file(file.ino.0, 0, 20).unwrap(),
+            b"Hello world"
+        );
+        *filesystem.drive.fail_upload.lock().unwrap() = false;
+        filesystem.flush_file(file.ino.0).unwrap();
+        *filesystem.drive.fail_delete.lock().unwrap() = true;
+        assert!(
+            filesystem
+                .unlink_file(ROOT_INODE, OsStr::new("hello.txt"))
+                .is_err()
+        );
+        assert!(
+            filesystem
+                .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn refuses_to_overwrite_an_incompletely_downloaded_file() {
+        let filesystem = filesystem();
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        filesystem
+            .drive
+            .files
+            .lock()
+            .unwrap()
+            .insert("file-1".into(), b"short".to_vec());
+        assert!(filesystem.write_file(file.ino.0, 0, b"changed").is_err());
+        assert!(
+            !filesystem
+                .nodes
+                .lock()
+                .unwrap()
+                .dirty
+                .contains_key(&file.ino.0)
+        );
+    }
+
+    #[test]
+    fn truncating_to_zero_does_not_download_old_contents() {
+        let filesystem = filesystem();
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(filesystem.truncate_file(file.ino.0, 0).unwrap().size, 0);
+        assert!(filesystem.drive.downloads.lock().unwrap().is_empty());
+        filesystem
+            .write_file(file.ino.0, 0, b"replacement")
+            .unwrap();
+        filesystem.flush_file(file.ino.0).unwrap();
+        assert_eq!(
+            filesystem.read_file(file.ino.0, 0, 20).unwrap(),
+            b"replacement"
         );
     }
 }

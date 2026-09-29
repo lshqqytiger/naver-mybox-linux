@@ -1,5 +1,5 @@
 use crate::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 
 const STORAGE_URL: &str = "https://open-api.mybox.naver.com/v1/drive/storage";
@@ -25,6 +25,14 @@ pub trait RemoteDrive: Send + Sync + 'static {
     fn list_root(&self) -> Result<Vec<RemoteEntry>>;
     fn list_children(&self, folder_id: &str) -> Result<Vec<RemoteEntry>>;
     fn download_file(&self, file_id: &str, offset: u64, size: u32) -> Result<Vec<u8>>;
+    fn upload_file(
+        &self,
+        parent_id: Option<&str>,
+        name: &str,
+        data: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<RemoteEntry>;
+    fn delete_file(&self, file_id: &str) -> Result<()>;
 }
 
 pub struct MyboxApiClient {
@@ -175,6 +183,78 @@ impl RemoteDrive for MyboxApiClient {
             })?;
         Ok(bytes)
     }
+
+    fn upload_file(
+        &self,
+        parent_id: Option<&str>,
+        name: &str,
+        data: Vec<u8>,
+        overwrite: bool,
+    ) -> Result<RemoteEntry> {
+        let request = UploadRequest {
+            file_name: name,
+            file_size: data.len() as u64,
+            parent_id,
+            is_overwrite: overwrite,
+        };
+        let response = self
+            .client
+            .post(format!("{DRIVE_URL}/files"))
+            .bearer_auth(&self.access_token)
+            .json(&request)
+            .send()?;
+        if !response.status().is_success() {
+            return Err(format!("MYBOX upload URL request failed: {}", response.status()).into());
+        }
+        let upload: UploadResponse = response.json()?;
+        let part = reqwest::blocking::multipart::Part::bytes(data).file_name(name.to_owned());
+        let form = reqwest::blocking::multipart::Form::new().part("Filedata", part);
+        let response = self
+            .client
+            .post(upload.upload_url)
+            .multipart(form)
+            .send()
+            .map_err(reqwest::Error::without_url)?;
+        if !response.status().is_success() {
+            return Err(format!("MYBOX file upload failed: {}", response.status()).into());
+        }
+        let entries = match parent_id {
+            Some(parent_id) => self.list_children(parent_id)?,
+            None => self.list_root()?,
+        };
+        entries
+            .into_iter()
+            .find(|entry| entry.name == name && !entry.is_directory())
+            .ok_or_else(|| "uploaded file not found in parent directory".into())
+    }
+
+    fn delete_file(&self, file_id: &str) -> Result<()> {
+        let response = self
+            .client
+            .delete(format!("{DRIVE_URL}/resources/{file_id}"))
+            .bearer_auth(&self.access_token)
+            .send()?;
+        if !response.status().is_success() {
+            return Err(format!("MYBOX file deletion failed: {}", response.status()).into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadRequest<'a> {
+    file_name: &'a str,
+    file_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_id: Option<&'a str>,
+    is_overwrite: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadResponse {
+    upload_url: String,
 }
 
 #[derive(Deserialize)]

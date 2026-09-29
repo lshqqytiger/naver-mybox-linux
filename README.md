@@ -14,13 +14,17 @@ The token is validated against the MYBOX storage API before it is saved to
 `$XDG_CONFIG_HOME/myboxfs/token` (or `~/.config/myboxfs/token`) with owner-only permissions.
 Use `myboxfs health-check` to verify the saved token.
 
-## Read-only Mount
+## Mount
 
 ```bash
 myboxfs mount /path/to/mountpoint
 ```
 
-The initial mount supports directory browsing, file attributes, and file reads. It is mounted read-only.
+The mount supports directory browsing, file reads, and creating, modifying, and deleting files.
+Writes are buffered in memory and uploaded on flush or close; deleting a file moves it to
+MYBOX trash. Editing an existing file first downloads its entire contents, so very large
+files may be slow or fail if the download times out. Directory creation and deletion,
+renaming, and moving are not supported yet. Check for upload errors when closing files.
 
 ## Debug Logs
 

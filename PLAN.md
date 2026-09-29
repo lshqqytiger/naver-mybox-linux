@@ -60,7 +60,9 @@ Build a Rust-based Linux adapter that mounts NAVER MYBOX storage as a filesystem
   - [x] Implement `getattr`, `readdir`, `open`, and `read`.
   - [ ] Verify file reads against the live MYBOX API after the range-read change.
 - [ ] **Read-Write Support**
-  - [ ] Implement `create`, `write`, `flush`, `unlink`, `rename`, `mkdir`, and `rmdir`.
+  - [x] Implement file `create`, `write`, `flush`, and `unlink` with upload on flush/close.
+  - [ ] Implement `rename`, `mkdir`, and `rmdir`.
+  - [ ] Verify create, edit, and delete against a live MYBOX account.
 - [ ] **Caching & Performance**
   - [ ] Tune attribute and directory cache TTLs.
   - [ ] Improve large-file reads and writes (range/chunk support; ranged reads implemented, live verification pending).
