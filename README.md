@@ -2,6 +2,15 @@
 
 Unofficial NAVER MYBOX Adapter for Linux.
 
+NAVER and MYBOX are trademarks of NAVER Corporation. This independent project
+is not affiliated with, sponsored by, or endorsed by NAVER Corporation.
+
+## Disclaimer
+
+This software is provided "as is", without warranty, under the terms of the
+[LICENSE](./LICENSE). It can modify or delete files in your MYBOX account.
+Back up important data and test with noncritical files before relying on it.
+
 ## Login
 
 Create a personal access token in MYBOX web settings under **Account and personal access token management**, then run:
