@@ -48,19 +48,19 @@ Verification: `mkdir`, `rmdir`, `mv`, `rm`, `cp`, `cat`, and `ls` work in the mo
 
 ## 5. Harden Writes and Network Failures
 
-- [ ] Replace whole-file in-memory edit buffers with bounded temporary storage or chunked uploads where the API supports them.
+- [x] Replace whole-file in-memory edit buffers with private temporary files, 1 MiB download chunks, and streamed multipart uploads.
 - [ ] Finish persistence semantics for concurrent open handles, `fsync`, `flush`, and failed close; handle remote edit conflicts atomically if the API permits it (pre-upload size/time checks are best-effort).
-- [ ] Map API/network failures to errno consistently and retry only safe transient requests (429, 5xx, timeouts) with bounded backoff.
-- [ ] Track file size and modification time from remote metadata; invalidate directory and attribute caches after mutations.
+- [x] Map known HTTP errors and timeouts to errno and retry only read requests (429, 5xx, timeouts) with bounded backoff; do not retry ambiguous mutations.
+- [x] Track file size and RFC3339 modification time from remote metadata; refresh directory listings on a short TTL and invalidate clean read caches after mutations.
 
 Verification: large-file edits, concurrent writes, interrupted uploads, and remounts retain the expected content and metadata.
 
 ## 6. Improve Performance and Security
 
-- [ ] Add bounded data and metadata caches with TTL and explicit invalidation; measure directory and large-file behavior before tuning.
-- [ ] Keep token and signed URL values out of logs; require HTTPS for API-provided transfer URLs and validate certificates.
-- [ ] Validate remote names and path handling, enforce mount permissions, and document token storage and recovery.
-- [ ] Add useful request correlation and latency diagnostics without exposing file contents or credentials.
+- [ ] Bound retained directory metadata and measure directory/large-file behavior before tuning (clean read cache is capped at 4 MiB with a two-second TTL; listings have a five-second TTL).
+- [x] Keep token and signed URL values out of logs; require HTTPS for API-provided transfer URLs and validate certificates.
+- [x] Validate remote names and resource-ID path segments, enforce FUSE default permissions, and document token storage and recovery.
+- [x] Add request IDs and latency/status diagnostics without exposing file contents or credentials.
 
 Verification: repeated reads avoid unnecessary transfers, mutations invalidate stale data, and security checks pass for malformed inputs.
 
