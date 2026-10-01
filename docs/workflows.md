@@ -12,7 +12,11 @@
    the FUSE filesystem. Run `myboxfs unmount MOUNTPOINT` to invoke
    `fusermount3` or `fusermount`.
 
-Saved token files use mode `0600`. Protect your home directory and never put
+Saved token files are created privately with mode `0600`, synced, and atomically
+replaced in an owner-only directory. Saving rejects symlink token files and
+symlink or non-private token directories. For an existing token directory from
+an older installation, set its permissions to `0700` before logging in again
+(for example, `chmod 700 ~/.config/myboxfs`). Protect your home directory and never put
 tokens in mount options, shell arguments, or `/etc/fstab`. If a token is lost
 or exposed, revoke it in MYBOX settings and run `myboxfs login` again. Only
 mount on directories you trust and unmount before removing local temporary
@@ -40,7 +44,12 @@ must be able to read that file. Never put a token itself in fstab.
 
 The helper runs in the background and returns only after FUSE has mounted;
 startup errors produce a nonzero exit status. Use `-o foreground` when invoking
-`mount.myboxfs` directly to keep it attached to the terminal. `-f` is a dry run,
+`mount.myboxfs` directly to keep it attached to the terminal with stderr logging.
+Background mounts send tracing events and terminal session errors to `/dev/log`
+with the `myboxfs` identifier (for example, `journalctl -t myboxfs` on journald
+systems). The helper fails startup if it cannot open this logging destination;
+use a supervised foreground mount on systems without it. `RUST_LOG` controls
+logging in both modes. `-f` is a dry run,
 not foreground mode. Add `user` to fstab to permit the usual non-root
 `mount /mnt/mybox` workflow where supported by the distribution's mount utility.
 For boot mounting, remove `noauto` and consider `nofail`; `_netdev` orders the
@@ -72,6 +81,10 @@ access through its resource ID. Listings refresh after five seconds,
 preserving inodes for unchanged resource IDs. Remote changes can remain
 invisible until the next refresh.
 
+Remotely removed or moved entries and their loaded descendants are detached
+from directory listings. Clean detached nodes are reclaimed when open and lookup
+references drain; dirty nodes retain their staged data for recovery.
+
 File reads request the requested byte range through MYBOX's download URL.
 If the server returns a full `200 OK` response instead of partial content,
 the client skips to the requested offset before reading the requested number
@@ -92,11 +105,21 @@ existing contents before resizing.
 `flush`, `fsync`, and file release upload the staged contents with overwrite
 enabled, streaming the staged file instead of copying it into memory. A
 successful upload replaces the in-memory remote entry and drops the temporary
-file. A failed upload leaves the staged file available for a later attempt
-during the same mount. A path-based truncate uploads before reporting success;
+file. A failed, uncommitted upload leaves the staged file available for a later
+attempt during the same mount. If the upload succeeds but metadata reconciliation
+fails, the mount records a committed pending upload rather than retrying it.
+Before accepting further edits, it verifies the resource ID in the parent listing,
+stable metadata, and the complete remote contents against the staged bytes.
+Missing or changed resource identity, listing failures, and byte mismatches fail
+closed while retaining staged data. If an overwrite changes the resource ID and
+the API supplies no authoritative commit identity, automatic reconciliation is
+not possible. Pending reconciliation also blocks unlink and rename of that file.
+A path-based truncate uploads before reporting success;
 pending edits do not survive process exit. Before staging and uploading, the
 mount checks remote size and modification time when available. This check is
-best-effort, not an atomic conditional write. Mutations are not automatically
+best-effort, not an atomic conditional write. Upload preflight also verifies that
+the cached filename in the expected parent still identifies the staged resource,
+rejecting detected remote renames, moves, and filename reuse. Mutations are not automatically
 retried because their outcome may be ambiguous after a network failure.
 
 Check errors from `flush` and `fsync`: failed closes may not be reported by
@@ -154,6 +177,4 @@ builds. Set `RUST_LOG=info` to reduce logging in a debug build.
 The current implementation does not provide full POSIX semantics, special
 files, advanced ACLs, offline synchronization, atomic conflict detection,
 cross-mount cache invalidation, or bounded retained directory metadata. Large
-edits require enough local temporary disk space. Live-account behavior and
-the API response contract still require the smoke tests tracked in
-[`PLAN.md`](../PLAN.md).
+edits require enough local temporary disk space.

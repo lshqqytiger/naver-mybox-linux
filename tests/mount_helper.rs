@@ -27,6 +27,29 @@ fn daemon_reports_missing_token_without_mounting() {
 }
 
 #[test]
+fn foreground_reports_tracing_diagnostics_without_exposing_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = format!(
+        "foreground,token_file={}/missing-token",
+        directory.path().display()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_mount-myboxfs"))
+        .env("RUST_LOG", "info")
+        .args([
+            current_user().as_str(),
+            "/nonexistent/mybox-mount",
+            "-o",
+            &options,
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("MYBOX mount helper failed"));
+    assert!(stderr.contains("no token for the selected user"));
+}
+
+#[test]
 fn fake_mount_does_not_read_credentials_or_require_fuse() {
     let output = Command::new(env!("CARGO_BIN_EXE_mount-myboxfs"))
         .args([

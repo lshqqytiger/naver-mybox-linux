@@ -26,6 +26,7 @@ flowchart TD
 | Module                     | Responsibility                                                                                                                          |
 | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `src/main.rs`              | Initializes tracing using `RUST_LOG` when set, then starts the CLI.                                                                     |
+| `src/logging.rs`           | Shared tracing setup: stderr for foreground processes and a syslog socket for detached helpers.                                         |
 | `src/cli.rs`               | Implements `login`, `health-check`, `mount`, and `unmount`.                                                                             |
 | `src/bin/mount-myboxfs.rs` | Entry point for the helper installed as `mount.myboxfs`.                                                                                |
 | `src/mount_helper.rs`      | Parses mount-helper arguments and FUSE options, selects the local user, drops privileges, and reports background startup status.        |
@@ -43,6 +44,12 @@ the production `MyboxApiClient` or a fake drive in tests. A mutex-protected
 lists, directory listing expiration times, open/lookup references, and temporary
 file handles for dirty data. Inode 1 represents the root; other inodes are
 assigned as directories are loaded or items are created.
+
+The table also tracks detached remote subtrees and committed uploads awaiting
+reconciliation. Clean detached inodes are reclaimed after references drain;
+dirty data is retained. A confirmed upload with failed metadata lookup enters
+pending reconciliation, blocking further mutations until resource identity,
+stable metadata, and staged bytes can be verified without uploading again.
 
 Directory contents are refreshed after five seconds, preserving existing
 inodes by resource ID. Successful local mutations update the table immediately.
@@ -70,7 +77,8 @@ bounded in memory.
 
 `MyboxApiClient::list_resources` follows API cursors to collect all pages.
 Tests can implement `RemoteDrive` without MYBOX credentials. Filesystem tests
-use a fake drive; a local HTTP test covers a transient read retry, but the
+use a fake drive; local HTTP tests cover a transient read retry and classification
+of successful multipart responses with failed metadata reconciliation, but the
 full MYBOX API contract has not been exercised against a mock HTTP server.
 
 ## Mount Helper
@@ -83,8 +91,9 @@ Token lookup uses the selected user's home rather than inherited root config
 paths; an absolute `token_file` option can override the location.
 
 Background mounts re-execute the helper as a detached child. The child creates
-a FUSE session and reports readiness or a startup error through a pipe before
+a FUSE session, opens `/dev/log` for runtime tracing, and reports readiness or a startup error through a pipe before
 redirecting standard streams to `/dev/null` and running the session. The parent
 returns success only after receiving readiness. Foreground mounts run the
-session directly. Option parsing preserves default permissions, disables
+session directly with stderr tracing. Terminal session errors are logged by the
+helper entry point. Option parsing preserves default permissions, disables
 set-user-ID and device handling, and maps access options to FUSE's session ACL.

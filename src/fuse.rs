@@ -16,7 +16,7 @@ use fuser::{
 
 use crate::{
     Result,
-    api::{ApiStatus, MyboxApiClient, RemoteDrive, RemoteEntry},
+    api::{ApiStatus, MyboxApiClient, RemoteDrive, RemoteEntry, UploadCommitted},
     cache::ReadCache,
 };
 
@@ -35,9 +35,11 @@ struct NodeTable {
     children: HashMap<u64, Vec<u64>>,
     dirty: HashMap<u64, File>,
     baselines: HashMap<u64, RemoteEntry>,
+    pending_uploads: HashSet<u64>,
     open_files: HashMap<u64, u64>,
     lookups: HashMap<u64, u64>,
     unlinked: HashSet<u64>,
+    detached: HashSet<u64>,
     loaded_directories: HashMap<u64, Instant>,
     next_inode: u64,
 }
@@ -49,9 +51,11 @@ impl NodeTable {
             children: HashMap::new(),
             dirty: HashMap::new(),
             baselines: HashMap::new(),
+            pending_uploads: HashSet::new(),
             open_files: HashMap::new(),
             lookups: HashMap::new(),
             unlinked: HashSet::new(),
+            detached: HashSet::new(),
             loaded_directories: HashMap::new(),
             next_inode: ROOT_INODE + 1,
         }
@@ -165,19 +169,7 @@ impl<D: RemoteDrive> MyboxFs<D> {
         }
         for inode in old_children {
             if !child_inodes.contains(&inode) {
-                if nodes.open_files.contains_key(&inode)
-                    || nodes.lookups.contains_key(&inode)
-                    || nodes.dirty.contains_key(&inode)
-                {
-                    continue;
-                }
-                nodes.nodes.remove(&inode);
-                nodes.children.remove(&inode);
-                nodes.loaded_directories.remove(&inode);
-                self.reads
-                    .lock()
-                    .map_err(|_| "read cache lock poisoned")?
-                    .invalidate(inode);
+                self.detach_subtree(&mut nodes, inode)?;
             }
         }
         nodes.children.insert(parent, child_inodes);
@@ -378,7 +370,11 @@ impl<D: RemoteDrive> MyboxFs<D> {
     }
 
     fn stage_file(&self, inode: u64) -> Result<()> {
+        self.reconcile_before_edit(inode)?;
         let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
+        if nodes.pending_uploads.contains(&inode) {
+            return Err("committed upload must be reconciled before editing".into());
+        }
         if nodes.dirty.contains_key(&inode) {
             return Ok(());
         }
@@ -411,6 +407,9 @@ impl<D: RemoteDrive> MyboxFs<D> {
     fn write_file(&self, inode: u64, offset: u64, data: &[u8]) -> Result<u32> {
         self.stage_file(inode)?;
         let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
+        if nodes.pending_uploads.contains(&inode) {
+            return Err("committed upload must be reconciled before editing".into());
+        }
         self.reads
             .lock()
             .map_err(|_| "read cache lock poisoned")?
@@ -438,12 +437,16 @@ impl<D: RemoteDrive> MyboxFs<D> {
     }
 
     fn truncate_file(&self, inode: u64, size: u64) -> Result<FileAttr> {
+        self.reconcile_before_edit(inode)?;
         self.reads
             .lock()
             .map_err(|_| "read cache lock poisoned")?
             .invalidate(inode);
         if size == 0 {
             let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
+            if nodes.pending_uploads.contains(&inode) {
+                return Err("committed upload must be reconciled before truncation".into());
+            }
             let node = nodes.nodes.get(&inode).ok_or("file inode not found")?;
             if node.entry.is_directory() {
                 return Err("cannot truncate a directory".into());
@@ -463,10 +466,13 @@ impl<D: RemoteDrive> MyboxFs<D> {
         }
         self.stage_file(inode)?;
         let mut nodes = self.nodes.lock().map_err(|_| "inode table lock poisoned")?;
+        if nodes.pending_uploads.contains(&inode) {
+            return Err("committed upload must be reconciled before truncation".into());
+        }
         let buffer = nodes.dirty.get_mut(&inode).ok_or("file not staged")?;
         buffer.set_len(size)?;
         let node = nodes.nodes.get_mut(&inode).ok_or("file inode not found")?;
-        node.entry.size = size as u64;
+        node.entry.size = size;
         Ok(self.entry_attr(node))
     }
 
@@ -493,22 +499,109 @@ impl<D: RemoteDrive> MyboxFs<D> {
             .baselines
             .get(&inode)
             .ok_or("missing staged file metadata")?;
+        if nodes.pending_uploads.contains(&inode) {
+            let parent_id = nodes
+                .nodes
+                .get(&node.parent)
+                .map(|parent| parent.entry.resource_id.as_str());
+            let siblings = match parent_id {
+                Some(parent_id) => self.drive.list_children(parent_id)?,
+                None => self.drive.list_root()?,
+            };
+            let mut destinations = siblings
+                .iter()
+                .filter(|entry| entry.name == node.entry.name);
+            let entry = destinations
+                .next()
+                .ok_or("committed upload not yet visible")?;
+            if destinations.next().is_some()
+                || entry.resource_id != baseline.resource_id
+                || entry.is_directory()
+                || entry.size != node.entry.size
+            {
+                return Err("cannot establish committed upload identity".into());
+            }
+            let before = self.drive.file_metadata(&entry.resource_id)?;
+            if before != *entry {
+                return Err("committed upload metadata is not stable".into());
+            }
+            let mut staged = data.try_clone()?;
+            staged.seek(SeekFrom::Start(0))?;
+            let mut offset = 0;
+            while offset < entry.size {
+                let size = (entry.size - offset).min(1024 * 1024) as u32;
+                let remote = self.drive.download_file(&entry.resource_id, offset, size)?;
+                let mut local = vec![0; size as usize];
+                staged.read_exact(&mut local)?;
+                if remote != local {
+                    return Err("committed upload differs from staged bytes".into());
+                }
+                offset += u64::from(size);
+            }
+            if self.drive.file_metadata(&entry.resource_id)? != before {
+                return Err("committed upload changed during reconciliation".into());
+            }
+            nodes
+                .nodes
+                .get_mut(&inode)
+                .ok_or("file inode not found")?
+                .entry = before;
+            nodes.pending_uploads.remove(&inode);
+            nodes.dirty.remove(&inode);
+            nodes.baselines.remove(&inode);
+            Self::reap_detached(&mut nodes, inode);
+            self.reads
+                .lock()
+                .map_err(|_| "read cache lock poisoned")?
+                .invalidate(inode);
+            return Ok(());
+        }
         let remote = self.drive.file_metadata(&node.entry.resource_id)?;
-        if !same_file_version(baseline, &remote) {
+        if remote.resource_id != baseline.resource_id
+            || remote.is_directory()
+            || !same_file_version(baseline, &remote)
+        {
             return Err("MYBOX file changed remotely while editing".into());
         }
         let parent_id = nodes
             .nodes
             .get(&node.parent)
             .map(|parent| parent.entry.resource_id.as_str());
+        let siblings = match parent_id {
+            Some(parent_id) => self.drive.list_children(parent_id)?,
+            None => self.drive.list_root()?,
+        };
+        let mut destinations = siblings
+            .iter()
+            .filter(|entry| entry.name == node.entry.name);
+        let destination = destinations
+            .next()
+            .ok_or("MYBOX upload destination disappeared")?;
+        if destinations.next().is_some()
+            || destination.resource_id != baseline.resource_id
+            || remote.name != node.entry.name
+            || destination.is_directory()
+            || !same_file_version(baseline, destination)
+        {
+            return Err("MYBOX upload destination changed remotely".into());
+        }
         let mut data = data.try_clone()?;
-        let entry = self.drive.upload_file(
+        let uploaded = self.drive.upload_file(
             parent_id,
             &node.entry.name,
             &mut data,
             node.entry.size,
             true,
-        )?;
+        );
+        let entry = match uploaded {
+            Ok(entry) => entry,
+            Err(error) => {
+                if error.downcast_ref::<UploadCommitted>().is_some() {
+                    nodes.pending_uploads.insert(inode);
+                }
+                return Err(error);
+            }
+        };
         nodes
             .nodes
             .get_mut(&inode)
@@ -516,10 +609,24 @@ impl<D: RemoteDrive> MyboxFs<D> {
             .entry = entry;
         nodes.dirty.remove(&inode);
         nodes.baselines.remove(&inode);
+        Self::reap_detached(&mut nodes, inode);
         self.reads
             .lock()
             .map_err(|_| "read cache lock poisoned")?
             .invalidate(inode);
+        Ok(())
+    }
+
+    fn reconcile_before_edit(&self, inode: u64) -> Result<()> {
+        let pending = self
+            .nodes
+            .lock()
+            .map_err(|_| "inode table lock poisoned")?
+            .pending_uploads
+            .contains(&inode);
+        if pending {
+            self.flush_file(inode)?;
+        }
         Ok(())
     }
 
@@ -569,6 +676,9 @@ impl<D: RemoteDrive> MyboxFs<D> {
         let node = nodes.nodes.get(&inode).ok_or("file not found")?;
         if node.entry.is_directory() {
             return Err("cannot unlink a directory".into());
+        }
+        if nodes.pending_uploads.contains(&inode) {
+            return Err("reconcile committed upload before unlinking".into());
         }
         if nodes.open_files.get(&inode).copied().unwrap_or(0) > 0
             && !nodes.dirty.contains_key(&inode)
@@ -651,6 +761,47 @@ impl<D: RemoteDrive> MyboxFs<D> {
             nodes.nodes.remove(&inode);
             nodes.dirty.remove(&inode);
             nodes.baselines.remove(&inode);
+            nodes.pending_uploads.remove(&inode);
+        }
+        Self::reap_detached(nodes, inode);
+    }
+
+    fn detach_subtree(&self, nodes: &mut NodeTable, inode: u64) -> Result<()> {
+        nodes.detached.insert(inode);
+        nodes.loaded_directories.remove(&inode);
+        self.reads
+            .lock()
+            .map_err(|_| "read cache lock poisoned")?
+            .invalidate(inode);
+        for child in nodes.children.get(&inode).cloned().unwrap_or_default() {
+            self.detach_subtree(nodes, child)?;
+        }
+        Self::reap_detached(nodes, inode);
+        Ok(())
+    }
+
+    fn reap_detached(nodes: &mut NodeTable, inode: u64) {
+        if !nodes.detached.contains(&inode)
+            || nodes.open_files.contains_key(&inode)
+            || nodes.lookups.contains_key(&inode)
+            || nodes.dirty.contains_key(&inode)
+            || nodes
+                .children
+                .get(&inode)
+                .is_some_and(|children| !children.is_empty())
+        {
+            return;
+        }
+        nodes.detached.remove(&inode);
+        nodes.children.remove(&inode);
+        nodes.loaded_directories.remove(&inode);
+        nodes.baselines.remove(&inode);
+        nodes.pending_uploads.remove(&inode);
+        if let Some(node) = nodes.nodes.remove(&inode) {
+            if let Some(children) = nodes.children.get_mut(&node.parent) {
+                children.retain(|child| *child != inode);
+            }
+            Self::reap_detached(nodes, node.parent);
         }
     }
 
@@ -762,6 +913,9 @@ impl<D: RemoteDrive> MyboxFs<D> {
         self.ensure_children(newparent).map_err(|_| Errno::EIO)?;
         let mut nodes = self.nodes.lock().map_err(|_| Errno::EIO)?;
         let inode = child_inode(&nodes, parent, name).ok_or(Errno::ENOENT)?;
+        if nodes.pending_uploads.contains(&inode) {
+            return Err(Errno::EIO);
+        }
         if parent == newparent && name == newname {
             return Ok(());
         }
@@ -1244,6 +1398,8 @@ mod tests {
         files: Mutex<HashMap<String, Vec<u8>>>,
         downloads: Mutex<Vec<(String, u64, u32)>>,
         fail_upload: Mutex<bool>,
+        commit_without_metadata: Mutex<bool>,
+        uploads: Mutex<u64>,
         fail_delete: Mutex<bool>,
         fail_move: Mutex<bool>,
         fail_rename: Mutex<bool>,
@@ -1316,13 +1472,24 @@ mod tests {
             if *self.fail_upload.lock().unwrap() {
                 return Err("upload failed".into());
             }
+            *self.uploads.lock().unwrap() += 1;
             data.seek(SeekFrom::Start(0))?;
             let mut bytes = Vec::new();
             data.read_to_end(&mut bytes)?;
             if bytes.len() as u64 != size {
                 return Err("incomplete staged upload".into());
             }
-            let id = format!("file-{name}");
+            let mut id = format!("file-{name}");
+            if *self.commit_without_metadata.lock().unwrap() {
+                let root = self.root.lock().unwrap();
+                let children = self.children.lock().unwrap();
+                let siblings = parent_id
+                    .and_then(|parent| children.get(parent))
+                    .unwrap_or(&root);
+                if let Some(existing) = siblings.iter().find(|existing| existing.name == name) {
+                    id = existing.resource_id.clone();
+                }
+            }
             let entry = entry(&id, name, size, "file");
             let mut root = self.root.lock().unwrap();
             let mut children = self.children.lock().unwrap();
@@ -1339,6 +1506,9 @@ mod tests {
                 siblings.push(entry.clone());
             }
             self.files.lock().unwrap().insert(id, bytes);
+            if *self.commit_without_metadata.lock().unwrap() {
+                return Err(UploadCommitted.into());
+            }
             Ok(entry)
         }
         fn delete_file(&self, file_id: &str) -> Result<()> {
@@ -1432,6 +1602,8 @@ mod tests {
             ])),
             downloads: Mutex::new(Vec::new()),
             fail_upload: Mutex::new(false),
+            commit_without_metadata: Mutex::new(false),
+            uploads: Mutex::new(0),
             fail_delete: Mutex::new(false),
             fail_move: Mutex::new(false),
             fail_rename: Mutex::new(false),
@@ -1500,6 +1672,74 @@ mod tests {
         filesystem.flush_file(file.ino.0).unwrap();
         assert_eq!(filesystem.read_file(file.ino.0, 0, 5).unwrap(), b"Hello");
         assert_eq!(filesystem.drive.downloads.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn reclaims_remotely_detached_subtrees_after_references_drain() {
+        let filesystem = filesystem();
+        let folder = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("Documents"))
+            .unwrap()
+            .unwrap();
+        let file = filesystem
+            .lookup_entry(folder.ino.0, OsStr::new("notes.txt"))
+            .unwrap()
+            .unwrap();
+        filesystem.remember_lookup(file.ino.0);
+        filesystem.open_file(file.ino.0).unwrap();
+        filesystem
+            .drive
+            .root
+            .lock()
+            .unwrap()
+            .retain(|entry| entry.resource_id != "folder-1");
+        filesystem
+            .nodes
+            .lock()
+            .unwrap()
+            .loaded_directories
+            .remove(&ROOT_INODE);
+        filesystem.ensure_children(ROOT_INODE).unwrap();
+        assert!(
+            filesystem
+                .nodes
+                .lock()
+                .unwrap()
+                .detached
+                .contains(&file.ino.0)
+        );
+        filesystem.forget_file(file.ino.0, 1);
+        assert!(filesystem.attr(file.ino.0).is_some());
+        filesystem.close_file(file.ino.0);
+        let nodes = filesystem.nodes.lock().unwrap();
+        assert!(!nodes.nodes.contains_key(&file.ino.0));
+        assert!(!nodes.nodes.contains_key(&folder.ino.0));
+        assert!(nodes.detached.is_empty());
+    }
+
+    #[test]
+    fn retains_dirty_data_after_remote_deletion() {
+        let filesystem = filesystem();
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        filesystem.remember_lookup(file.ino.0);
+        filesystem.write_file(file.ino.0, 0, b"H").unwrap();
+        filesystem.drive.delete_file("file-1").unwrap();
+        filesystem
+            .nodes
+            .lock()
+            .unwrap()
+            .loaded_directories
+            .remove(&ROOT_INODE);
+        filesystem.ensure_children(ROOT_INODE).unwrap();
+        filesystem.forget_file(file.ino.0, 1);
+        assert_eq!(
+            filesystem.read_file(file.ino.0, 0, 20).unwrap(),
+            b"Hello world"
+        );
+        assert!(filesystem.flush_file(file.ino.0).is_err());
     }
 
     #[test]
@@ -1726,6 +1966,135 @@ mod tests {
                 .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn reconciles_committed_upload_without_reuploading() {
+        let filesystem = filesystem();
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        filesystem.write_file(file.ino.0, 11, b"!").unwrap();
+        *filesystem.drive.commit_without_metadata.lock().unwrap() = true;
+        assert!(filesystem.flush_file(file.ino.0).is_err());
+        assert!(
+            filesystem
+                .nodes
+                .lock()
+                .unwrap()
+                .pending_uploads
+                .contains(&file.ino.0)
+        );
+        let committed = filesystem.drive.root.lock().unwrap().pop().unwrap();
+        assert!(filesystem.flush_file(file.ino.0).is_err());
+        assert!(filesystem.truncate_file(file.ino.0, 0).is_err());
+        filesystem.drive.root.lock().unwrap().push(committed);
+        filesystem
+            .drive
+            .files
+            .lock()
+            .unwrap()
+            .insert("file-1".into(), b"externaldata".to_vec());
+        assert!(filesystem.write_file(file.ino.0, 0, b"X").is_err());
+        assert!(
+            filesystem
+                .unlink_file(ROOT_INODE, OsStr::new("hello.txt"))
+                .is_err()
+        );
+        assert!(
+            filesystem
+                .rename_path(
+                    ROOT_INODE,
+                    OsStr::new("hello.txt"),
+                    ROOT_INODE,
+                    OsStr::new("renamed.txt")
+                )
+                .is_err()
+        );
+        assert!(filesystem.flush_file(file.ino.0).is_err());
+        filesystem
+            .drive
+            .files
+            .lock()
+            .unwrap()
+            .insert("file-1".into(), b"hello world!".to_vec());
+        filesystem.flush_file(file.ino.0).unwrap();
+        assert_eq!(*filesystem.drive.uploads.lock().unwrap(), 1);
+        assert!(
+            !filesystem
+                .nodes
+                .lock()
+                .unwrap()
+                .dirty
+                .contains_key(&file.ino.0)
+        );
+        *filesystem.drive.commit_without_metadata.lock().unwrap() = false;
+        filesystem.write_file(file.ino.0, 0, b"H").unwrap();
+        filesystem.flush_file(file.ino.0).unwrap();
+        assert_eq!(*filesystem.drive.uploads.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn rejects_remote_rename_and_reuse_of_upload_destination() {
+        let filesystem = filesystem();
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        filesystem.write_file(file.ino.0, 0, b"H").unwrap();
+        filesystem
+            .drive
+            .rename_resource("file-1", "renamed.txt")
+            .unwrap();
+        filesystem
+            .drive
+            .root
+            .lock()
+            .unwrap()
+            .push(entry("replacement", "hello.txt", 11, "file"));
+        filesystem
+            .drive
+            .files
+            .lock()
+            .unwrap()
+            .insert("replacement".into(), b"other bytes".to_vec());
+        assert!(filesystem.flush_file(file.ino.0).is_err());
+        assert_eq!(
+            filesystem.drive.files.lock().unwrap()["replacement"],
+            b"other bytes"
+        );
+        assert_eq!(
+            filesystem.drive.files.lock().unwrap()["file-1"],
+            b"hello world"
+        );
+        assert_eq!(
+            filesystem.read_file(file.ino.0, 0, 20).unwrap(),
+            b"Hello world"
+        );
+    }
+
+    #[test]
+    fn rejects_remote_move_with_unchanged_filename() {
+        let filesystem = filesystem();
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        filesystem.write_file(file.ino.0, 0, b"H").unwrap();
+        filesystem
+            .drive
+            .move_resource("file-1", Some("folder-1"))
+            .unwrap();
+        assert!(filesystem.flush_file(file.ino.0).is_err());
+        assert!(
+            !filesystem
+                .drive
+                .files
+                .lock()
+                .unwrap()
+                .contains_key("file-hello.txt")
         );
     }
 

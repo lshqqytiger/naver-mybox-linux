@@ -237,7 +237,9 @@ pub fn run() -> Result<()> {
             if unsafe { libc::setsid() } == -1 {
                 return Err(std::io::Error::last_os_error().into());
             }
-            start_session(&args, settings)
+            let session = start_session(&args, settings)?;
+            crate::logging::init(true)?;
+            Ok(session)
         })();
         let session = match result {
             Ok(session) => session,
@@ -262,6 +264,7 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     if settings.foreground {
+        crate::logging::init(false)?;
         start_session(&args, settings)?.run()?;
         return Ok(());
     }

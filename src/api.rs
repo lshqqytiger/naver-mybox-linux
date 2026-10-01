@@ -30,6 +30,25 @@ impl fmt::Display for ApiStatus {
 
 impl Error for ApiStatus {}
 
+#[derive(Debug)]
+pub struct UploadCommitted;
+
+impl fmt::Display for UploadCommitted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MYBOX upload committed; metadata reconciliation required")
+    }
+}
+
+impl Error for UploadCommitted {}
+
+fn finish_upload(
+    response: reqwest::blocking::Response,
+    reconcile: impl FnOnce() -> Result<RemoteEntry>,
+) -> Result<RemoteEntry> {
+    status_error("file upload", response.status())?;
+    reconcile().map_err(|_| UploadCommitted.into())
+}
+
 pub(crate) fn status_error(
     operation: &'static str,
     status: reqwest::StatusCode,
@@ -340,15 +359,16 @@ impl RemoteDrive for MyboxApiClient {
         let form = reqwest::blocking::multipart::Form::new().part("Filedata", part);
         let response =
             self.send_mutation("upload", self.client.post(upload_url).multipart(form))?;
-        status_error("file upload", response.status())?;
-        let entries = match parent_id {
-            Some(parent_id) => self.list_children(parent_id)?,
-            None => self.list_root()?,
-        };
-        entries
-            .into_iter()
-            .find(|entry| entry.name == name && !entry.is_directory())
-            .ok_or_else(|| "uploaded file not found in parent directory".into())
+        finish_upload(response, || {
+            let entries = match parent_id {
+                Some(parent_id) => self.list_children(parent_id)?,
+                None => self.list_root()?,
+            };
+            entries
+                .into_iter()
+                .find(|entry| entry.name == name && !entry.is_directory())
+                .ok_or_else(|| "uploaded file not found in parent directory".into())
+        })
     }
 
     fn delete_file(&self, file_id: &str) -> Result<()> {
@@ -506,17 +526,39 @@ struct DownloadResponse {
 mod tests {
     use super::*;
     use std::{
-        io::{Read, Write},
-        net::TcpListener,
+        io::{BufRead, BufReader, Read, Write},
+        net::{TcpListener, TcpStream},
     };
+
+    fn consume_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut reader = BufReader::new(stream);
+        let mut length = 0;
+        let mut header_size = 0;
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            header_size += line.len();
+            assert!(header_size < 65536);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        body
+    }
 
     #[test]
     fn failed_signed_download_does_not_expose_its_query() {
         let client = MyboxApiClient::new("unused");
         let error = client
             .download_range("https://127.0.0.1:0/download?stoken=private-marker", 0, 10)
-            .err()
-            .expect("unused local port should fail");
+            .expect_err("unused local port should fail");
         assert!(!error.to_string().contains("private-marker"));
     }
 
@@ -542,14 +584,46 @@ mod tests {
     }
 
     #[test]
+    fn successful_multipart_with_failed_listing_reports_committed_upload() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let body = consume_request(&mut stream);
+                assert!(String::from_utf8_lossy(&body).contains("name=\"Filedata\""));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            }
+        });
+        let client = MyboxApiClient::new("unused");
+        for missing in [false, true] {
+            let form = reqwest::blocking::multipart::Form::new().text("Filedata", "staged bytes");
+            let response = client
+                .send_mutation("upload", client.client.post(&url).multipart(form))
+                .unwrap();
+            let error = finish_upload(response, || {
+                if missing {
+                    Err("uploaded file not found in parent directory".into())
+                } else {
+                    Err("listing unavailable".into())
+                }
+            })
+            .unwrap_err();
+            assert!(error.downcast_ref::<UploadCommitted>().is_some());
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
     fn retries_a_transient_read() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             for status in ["503 Service Unavailable", "200 OK"] {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0; 1024];
-                stream.read(&mut request).unwrap();
+                consume_request(&mut stream);
                 write!(
                     stream,
                     "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

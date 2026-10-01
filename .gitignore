@@ -1,4 +1,5 @@
 .context
-.github
+.github/*
+!.github/workflows
 
 /target

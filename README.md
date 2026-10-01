@@ -34,6 +34,8 @@ myboxfs login
 
 Log in as your normal user, not root. Use `myboxfs health-check` to verify the
 saved token. Never put the token in shell arguments or `/etc/fstab`.
+Token directories must be owned by your user with mode `0700`; older installations
+may need `chmod 700 ~/.config/myboxfs` before saving a replacement token.
 
 ## Mount
 
