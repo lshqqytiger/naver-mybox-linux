@@ -12,6 +12,58 @@
    the FUSE filesystem. Run `myboxfs unmount MOUNTPOINT` to invoke
    `fusermount3` or `fusermount`.
 
+Saved token files use mode `0600`. Protect your home directory and never put
+tokens in mount options, shell arguments, or `/etc/fstab`. If a token is lost
+or exposed, revoke it in MYBOX settings and run `myboxfs login` again. Only
+mount on directories you trust and unmount before removing local temporary
+storage. Files use the mounting user's UID/GID; other users cannot access the
+mount by default.
+
+## Fstab Mounting
+
+Build and install the helper as described in the [setup guide](../README.md#setup).
+The installed name must be `mount.myboxfs` in the system mount-helper directory,
+usually `/sbin` or its merged `/usr/sbin` equivalent. Run `myboxfs login` as the
+intended local user and give that user ownership of the mountpoint.
+
+```fstab
+alice /mnt/mybox myboxfs defaults,_netdev,noauto 0 0
+```
+
+The source field selects the local user whose MYBOX account is mounted. The
+helper drops root privileges and sets that user's supplementary groups before
+reading credentials or starting FUSE. It finds the user's home in the system
+account database and reads `.config/myboxfs/token` beneath it, never using
+root's `HOME` or `XDG_CONFIG_HOME`. If login used a custom `XDG_CONFIG_HOME`, add
+`token_file=/absolute/path/to/myboxfs/token` to the options. The selected user
+must be able to read that file. Never put a token itself in fstab.
+
+The helper runs in the background and returns only after FUSE has mounted;
+startup errors produce a nonzero exit status. Use `-o foreground` when invoking
+`mount.myboxfs` directly to keep it attached to the terminal. `-f` is a dry run,
+not foreground mode. Add `user` to fstab to permit the usual non-root
+`mount /mnt/mybox` workflow where supported by the distribution's mount utility.
+For boot mounting, remove `noauto` and consider `nofail`; `_netdev` orders the
+mount after networking but does not guarantee MYBOX connectivity. Encrypted
+home directories must be unlocked before their token files can be read.
+
+Supported FUSE options are `ro`/`rw`, `exec`/`noexec`, `atime`/`noatime`,
+`sync`/`async`, `dirsync`, `allow_other`, and `allow_root`. Opposing flags use
+the last supplied value. `default_permissions`, `nosuid`, and `nodev` are
+always enforced; ownership cannot be overridden using `uid` or `gid`.
+`allow_other` grants other users access subject to the fixed file permissions;
+`allow_root` grants access to root and the owner. Both require
+`user_allow_other` in `/etc/fuse.conf` for an unprivileged mount. Fstab options
+such as `defaults`, `_netdev`, `noauto`, `user`, `nofail`, and `x-systemd.*`
+are accepted as mount-manager metadata. Unknown or unsafe options are rejected,
+even with `-s`, rather than silently ignored.
+
+Verify an installed helper with `sudo mount /mnt/mybox`, `findmnt /mnt/mybox`,
+and read/write tests on noncritical files, then unmount. To uninstall, unmount
+first, remove the fstab entry, and remove `/sbin/mount.myboxfs` and
+`/usr/local/bin/myboxfs`. Real-account and boot-mount verification still require
+MYBOX credentials and a FUSE-capable machine.
+
 ## Browsing and Reading
 
 The root directory is represented by a synthetic inode. Its first listing
@@ -47,6 +99,13 @@ mount checks remote size and modification time when available. This check is
 best-effort, not an atomic conditional write. Mutations are not automatically
 retried because their outcome may be ambiguous after a network failure.
 
+Check errors from `flush` and `fsync`: failed closes may not be reported by
+every application, and unflushed data does not survive unmount or process exit.
+An open file can still be used after unlink until its last handle closes;
+deleting it does not upload buffered edits again. Avoid concurrent edits from
+other clients or handles. Another client can change a file between the version
+check and upload, and when MYBOX omits modification time only size is compared.
+
 ## Directories and Mutations
 
 | Operation                 | Current behavior                                                                                                       |
@@ -64,7 +123,31 @@ nonempty root listing; this fails if that listing is empty. Names must be
 valid UTF-8 and may not be empty, `.` or `..`, or contain `/` or NUL. Remote
 resource IDs are encoded as URL path segments. The mount uses fixed file and
 directory modes (`0644` and `0755`) and FUSE default permissions; it does not
-enable `allow_other`.
+enable `allow_other` by default. The fstab helper can enable it explicitly.
+Other creation modes and changes to permissions, ownership, or timestamps are
+unsupported and return an error.
+
+## Network Failures
+
+Read-only requests retry up to twice after HTTP 429, 5xx, or a timeout, with
+bounded backoff. Uploads, deletes, moves, and renames are not retried because a
+failed response may follow a successful remote mutation. A 10-second connection
+timeout and five-minute total request timeout apply. Known HTTP failures are
+mapped to filesystem errors (for example, 404 to `ENOENT`, 403 to `EACCES`,
+429 to `EAGAIN`); other failures may return `EIO`.
+
+## Debug Logs
+
+Run `cargo run -- mount /path/to/mountpoint` to see debug logs for file downloads,
+including the requested byte range, response status, and content headers.
+Body-read errors report their I/O kind without logging signed URLs. File reads
+request only the bytes needed by FUSE. Request logs include an ID, operation,
+HTTP status, attempt, and elapsed time, but never a token, signed URL, or file
+contents. Transfer URLs must use HTTPS; TLS certificates are verified by the
+HTTP client and redirects cannot downgrade to HTTP.
+
+Debug logs are enabled by default in debug builds and are unavailable in release
+builds. Set `RUST_LOG=info` to reduce logging in a debug build.
 
 ## Scope and Limitations
 
