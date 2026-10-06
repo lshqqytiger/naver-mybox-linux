@@ -151,6 +151,11 @@ Directory creation accepts the requested mode and umask but exposes the fixed
 `0755` directory mode. Other file creation modes and changes to permissions,
 ownership, or timestamps are unsupported and return an error.
 
+Extended attribute probes return an empty list; reading any named attribute
+(including `security.capability`) returns `ENODATA`. Unknown inodes return
+`ENOENT`. Setting or removing extended attributes remains unsupported; no
+extended attributes are stored locally or synchronized with MYBOX.
+
 ## Network Failures
 
 Read-only requests retry up to twice after HTTP 429, 5xx, or a timeout, with

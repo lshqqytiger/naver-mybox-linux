@@ -11,7 +11,7 @@ use std::{
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
     MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
 };
 
 use crate::{
@@ -244,6 +244,16 @@ impl<D: RemoteDrive> MyboxFs<D> {
             blksize: 4096,
             flags: 0,
         }
+    }
+
+    fn list_xattrs(&self, inode: u64) -> std::result::Result<&[u8], Errno> {
+        self.attr(inode).ok_or(Errno::ENOENT)?;
+        Ok(&[])
+    }
+
+    fn get_xattr(&self, inode: u64, _name: &OsStr) -> std::result::Result<&[u8], Errno> {
+        self.list_xattrs(inode)?;
+        Err(Errno::ENODATA)
     }
 
     fn lookup_entry(&self, parent: u64, name: &OsStr) -> Result<Option<FileAttr>> {
@@ -1030,6 +1040,21 @@ fn child_inode(nodes: &NodeTable, parent: u64, name: &str) -> Option<u64> {
 }
 
 impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, _size: u32, reply: ReplyXattr) {
+        match self.get_xattr(ino.0, name) {
+            Ok(data) => reply.data(data),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        match self.list_xattrs(ino.0) {
+            Ok(data) if size == 0 => reply.size(data.len() as u32),
+            Ok(data) => reply.data(data),
+            Err(error) => reply.error(error),
+        }
+    }
+
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
         self.forget_file(ino.0, nlookup);
     }
@@ -2321,6 +2346,37 @@ mod tests {
         assert_eq!(
             filesystem.drive.files.lock().unwrap()["file-1"],
             b"hello world"
+        );
+    }
+
+    #[test]
+    fn xattr_probes_report_empty_lists_and_missing_attributes() {
+        let filesystem = filesystem();
+        let file = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("hello.txt"))
+            .unwrap()
+            .unwrap();
+        let directory = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("Documents"))
+            .unwrap()
+            .unwrap();
+        for inode in [ROOT_INODE, file.ino.0, directory.ino.0] {
+            assert_eq!(filesystem.list_xattrs(inode).unwrap(), &[] as &[u8]);
+            for name in [
+                "security.capability",
+                "user.example",
+                "system.posix_acl_access",
+            ] {
+                assert_eq!(
+                    filesystem.get_xattr(inode, OsStr::new(name)),
+                    Err(Errno::ENODATA)
+                );
+            }
+        }
+        assert_eq!(filesystem.list_xattrs(u64::MAX), Err(Errno::ENOENT));
+        assert_eq!(
+            filesystem.get_xattr(u64::MAX, OsStr::new("security.capability")),
+            Err(Errno::ENOENT)
         );
     }
 
