@@ -147,9 +147,9 @@ valid UTF-8 and may not be empty, `.` or `..`, or contain `/` or NUL. Remote
 resource IDs are encoded as URL path segments. The mount uses fixed file and
 directory modes (`0644` and `0755`) and FUSE default permissions; it does not
 enable `allow_other` by default. The fstab helper can enable it explicitly.
-Directory creation accepts the requested mode and umask but exposes the fixed
-`0755` directory mode. Other file creation modes and changes to permissions,
-ownership, or timestamps are unsupported and return an error.
+File and directory creation accept the requested mode and umask but expose the
+fixed `0644` file and `0755` directory modes. Changes to permissions, ownership,
+or timestamps are unsupported and return an error.
 
 Extended attribute probes return an empty list; reading any named attribute
 (including `security.capability`) returns `ENODATA`. Unknown inodes return

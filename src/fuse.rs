@@ -1108,15 +1108,11 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        mode: u32,
-        umask: u32,
+        _mode: u32,
+        _umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        if mode & !umask & 0o777 != 0o644 {
-            reply.error(Errno::EOPNOTSUPP);
-            return;
-        }
         match self.lookup_entry(parent.0, name) {
             Ok(Some(_)) => {
                 reply.error(Errno::EEXIST);
@@ -1920,6 +1916,8 @@ mod tests {
             .create_file(documents.ino.0, OsStr::new("draft.txt"))
             .unwrap();
         assert_eq!(created.size, 0);
+        assert_eq!(created.kind, FileType::RegularFile);
+        assert_eq!(created.perm, 0o644);
         assert_eq!(
             filesystem.write_file(created.ino.0, 0, b"hello").unwrap(),
             5
