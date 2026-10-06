@@ -1038,14 +1038,10 @@ impl<D: RemoteDrive> Filesystem for MyboxFs<D> {
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        mode: u32,
-        umask: u32,
+        _mode: u32,
+        _umask: u32,
         reply: ReplyEntry,
     ) {
-        if mode & !umask & 0o777 != 0o755 {
-            reply.error(Errno::EOPNOTSUPP);
-            return;
-        }
         match self.mkdir_folder(parent.0, name) {
             Ok(attr) => {
                 self.remember_lookup(attr.ino.0);
@@ -2363,6 +2359,49 @@ mod tests {
         assert_eq!(
             filesystem.rmdir_folder(ROOT_INODE, OsStr::new("hello.txt")),
             Err(Errno::ENOTDIR)
+        );
+    }
+
+    #[test]
+    fn creates_nested_folders_with_fixed_permissions_and_visible_metadata() {
+        let filesystem = filesystem();
+        let documents = filesystem
+            .lookup_entry(ROOT_INODE, OsStr::new("Documents"))
+            .unwrap()
+            .unwrap();
+        let folder = filesystem
+            .mkdir_folder(documents.ino.0, OsStr::new("2"))
+            .unwrap();
+        assert_eq!(folder.kind, FileType::Directory);
+        assert_eq!(folder.perm, 0o755);
+        assert_eq!(
+            filesystem
+                .lookup_entry(documents.ino.0, OsStr::new("2"))
+                .unwrap()
+                .unwrap()
+                .ino,
+            folder.ino
+        );
+        assert!(
+            filesystem
+                .directory_entries(documents.ino.0)
+                .unwrap()
+                .contains(&(folder.ino.0, FileType::Directory, "2".into()))
+        );
+        let parent_id = filesystem.nodes.lock().unwrap().nodes[&documents.ino.0]
+            .entry
+            .resource_id
+            .clone();
+        assert!(
+            filesystem.drive.children.lock().unwrap()[&parent_id]
+                .iter()
+                .any(|entry| entry.name == "2" && entry.is_directory())
+        );
+        assert!(
+            filesystem
+                .directory_entries(folder.ino.0)
+                .unwrap()
+                .is_empty()
         );
     }
 
